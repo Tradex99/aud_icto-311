@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-login.py — DB-backed Audius login + wallet-API credential capture (Chromium).
+login.py - DB-backed Audius login + wallet-API credential capture (Chromium).
 
 Behaviour:
   * Up to 10 sequential, fully independent runs per invocation.
@@ -111,7 +111,7 @@ async def click_first_match(page, selectors: list[str],
             loc = page.locator(sel).first
             await loc.wait_for(state="visible", timeout=per_selector_timeout)
             await loc.click()
-            print(f"    clicked via: {sel}")
+            print(f"   -> clicked via: {sel}")
             return sel
         except Exception as e:
             last_err = e
@@ -123,13 +123,13 @@ async def click_first_match(page, selectors: list[str],
 
 
 # --------------------------------------------------------------------------
-# Request capture handler — clean, human-readable output
+# Request capture handler - clean, human-readable output
 # --------------------------------------------------------------------------
 def _shorten(value: str, head: int = 20, tail: int = 6) -> str:
     """Show first `head` and last `tail` chars, ellipsis in the middle."""
     if len(value) <= head + tail + 3:
         return value
-    return f"{value[:head]}…{value[-tail:]}"
+    return f"{value[:head]}...{value[-tail:]}"
 
 
 def build_request_handler(captured: dict):
@@ -152,10 +152,10 @@ def build_request_handler(captured: dict):
         captured["encoded_dm"] = enc_dm
         captured["encoded_ds"] = enc_ds
 
-        print(" Wallet API credentials captured")
-        print(f"   api_key          : {api_key}")
-        print(f"   Encoded-Data-Msg : {enc_dm}")
-        print(f"   Encoded-Data-Sig : {_shorten(enc_ds)}")
+        print("[*] Wallet API credentials captured")
+        print(f"    api_key          : {api_key}")
+        print(f"    Encoded-Data-Msg : {enc_dm}")
+        print(f"    Encoded-Data-Sig : {_shorten(enc_ds)}")
     return handler
 
 
@@ -175,7 +175,7 @@ def claim_fresh_account(supabase, tried: set[str]) -> dict | None:
         cand = resp.data[0]
         if cand["address"] not in tried:
             return cand
-        # This one was already attempted in this run  put it back and re-roll
+        # This one was already attempted in this run -> put it back and re-roll
         supabase.table("audius").update({"active": False}) \
             .eq("address", cand["address"]).execute()
     return None                               # every claim collided with `tried`
@@ -187,7 +187,7 @@ def claim_fresh_account(supabase, tried: set[str]) -> dict | None:
 async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     """
     Returns (success, address).
-    address is None    no fresh account left (pool exhausted for this session).
+    address is None  ->  no fresh account left (pool exhausted for this session).
     """
     # --- Claim ----------------------------------------------------------
     account = claim_fresh_account(supabase, tried)
@@ -196,11 +196,11 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
 
     address  = account["address"]
     password = account["password"]
-    print(f" Claimed account: {address}")
+    print(f"[*] Claimed account: {address}")
 
     # --- Fresh random UA every run -------------------------------------
     user_agent = read_user_agent()
-    print(f"  User agent: {user_agent}")
+    print(f"[*] User agent: {user_agent}")
 
     captured: dict = {}
 
@@ -246,13 +246,13 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         await page.fill('input[aria-label="Email"]',    address)
         await page.fill('input[aria-label="Password"]', password)
 
-        print("Waiting 1s before clicking Sign In…")
+        print("Waiting 1s before clicking Sign In...")
         await page.wait_for_timeout(1000)
 
         try:
             await click_first_match(page, LOGIN_BUTTON_SELECTORS)
         except RuntimeError as e:
-            print(" Could not click Log In:", e)
+            print("[!] Could not click Log In:", e)
             return False, address
 
         try:
@@ -271,9 +271,9 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             if not m:
                 raise RuntimeError(f"OTP not found (stdout={stdout!r})")
             otp = m.group(0)
-            print(" OTP:", otp)
+            print("[*] OTP:", otp)
         except Exception as e:
-            print(" tempmail inbox failed:", e)
+            print("[!] tempmail inbox failed:", e)
             return False, address
 
         await page.fill('input[aria-label="Code"]', otp)
@@ -282,20 +282,20 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         try:
             await click_first_match(page, OTP_BUTTON_SELECTORS)
         except RuntimeError as e:
-            print(" Could not click OTP submit:", e)
+            print("[!] Could not click OTP submit:", e)
             return False, address
 
         try:
             await page.wait_for_url("https://audius.co/feed",
                                     wait_until="load", timeout=60_000)
-            print(" Login success — feed loaded")
+            print("[+] Login success - feed loaded")
         except Exception:
             if "https://audius.co/feed" not in page.url:
-                print(" Failed to reach feed. URL:", page.url)
+                print("[!] Failed to reach feed. URL:", page.url)
                 return False, address
 
         # --- Wallet + capture -------------------------------------------
-        print(" Opening https://audius.co/wallet …")
+        print("[*] Opening https://audius.co/wallet ...")
         await page.goto("https://audius.co/wallet",
                         wait_until="domcontentloaded", timeout=60_000)
 
@@ -310,13 +310,13 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
                 "encoded_dm": captured["encoded_dm"],
                 "encoded_ds": captured["encoded_ds"],
             }).eq("address", address).execute()
-            print(" Saved api_key / Encoded-Data-Message / Encoded-Data-Signature")
+            print("[+] Saved api_key / Encoded-Data-Message / Encoded-Data-Signature")
             success = True
         else:
-            print("  No target API captured within 30 s")
+            print("[!] No target API captured within 30 s")
 
     except Exception as e:
-        print(" Fatal:", e)
+        print("[!] Fatal:", e)
     finally:
         try:
             await browser.close()
@@ -326,7 +326,7 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     # --- Release on failure --------------------------------------------
     if not success:
         supabase.table("audius").update({"active": False}).eq("address", address).execute()
-        print(f"  Released {address} back to the pool")
+        print(f"[*] Released {address} back to the pool")
 
     return success, address
 
@@ -345,7 +345,7 @@ async def main() -> None:
 
     for i in range(1, MAX_RUNS + 1):
         print(f"\n{'=' * 60}")
-        print(f" Run {i}/{MAX_RUNS}  —  launching fresh Playwright + Chromium")
+        print(f"[*] Run {i}/{MAX_RUNS}  -  launching fresh Playwright + Chromium")
         print('=' * 60)
 
         # Fresh Playwright server + browser per iteration
@@ -353,7 +353,7 @@ async def main() -> None:
             success, address = await run_one(pw, supabase, tried)
 
         if address is None:
-            print(" No fresh eligible account left — pool exhausted for this session.")
+            print("[*] No fresh eligible account left - pool exhausted for this session.")
             exhausted = True
             break
 
@@ -362,11 +362,11 @@ async def main() -> None:
             ok += 1
         else:
             failed += 1
-        print(f" Run {i} finished — browser closed")
+        print(f"[*] Run {i} finished - browser closed")
 
     # --- Summary --------------------------------------------------------
     print(f"\n{'=' * 60}")
-    print(" Session summary")
+    print("[*] Session summary")
     print('=' * 60)
     print(f"  runs completed : {ok + failed}")
     print(f"  succeeded      : {ok}")
@@ -374,11 +374,11 @@ async def main() -> None:
     print(f"  distinct tried : {len(tried)}")
 
     if exhausted:
-        print(" Stopped early — no fresh account left.")
+        print("[*] Stopped early - no fresh account left.")
     elif ok + failed >= MAX_RUNS:
-        print(f" Reached the {MAX_RUNS}-run cap.")
+        print(f"[+] Reached the {MAX_RUNS}-run cap.")
     else:
-        print("  Loop ended without hitting either cap (unexpected).")
+        print("[i] Loop ended without hitting either cap (unexpected).")
 
 
 if __name__ == "__main__":
