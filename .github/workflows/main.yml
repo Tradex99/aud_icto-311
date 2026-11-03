@@ -26,16 +26,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run main.py
+      # ---------------------------------------------------------------
+      # Chromium + its OS libraries (cannot live in requirements.txt)
+      # ---------------------------------------------------------------
+      - name: Install Playwright Chromium (with OS deps)
+        run: |
+          python -m playwright install --with-deps chromium
+
+      # ---------------------------------------------------------------
+      # Xvfb — required because login.py launches headless=False
+      # ---------------------------------------------------------------
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Run login.py under Xvfb
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          timeout 355m python3 -u main.py || true
+          timeout 355m xvfb-run -a --server-args="-screen 0 1280x720x24" \
+            python3 -u login.py || true
 
       - name: Trigger the next run
         if: always()
