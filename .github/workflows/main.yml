@@ -52,7 +52,7 @@ jobs:
           PYTHONIOENCODING: "utf-8"
         run: |
           timeout 355m xvfb-run -a --server-args="-screen 0 1280x720x24" \
-            python3 -u src/signup.py || true
+            python3 -u src/login.py || true
 
       - name: Trigger the next run
         if: always()
