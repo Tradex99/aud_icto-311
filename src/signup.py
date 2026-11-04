@@ -24,6 +24,8 @@ NAME_FILE   = ROOT_DIR / "name.txt"
 IMG_SCRIPT  = SCRIPT_DIR / "img.py"
 TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
 
+MAX_RUNS = 5
+
 API_PATTERN = re.compile(r"https?://api\.audius\.co/(?:v1/)?users/[^/]+/(?:coins|connected_wallets)")
 STEP_SETTLE_MS = 3_000
 PRE_FINAL_WAIT_MS = 20_000
@@ -221,7 +223,7 @@ async def heartbeat_loop(supabase, address: str):
 # --------------------------------------------------------------------------
 # Main worker
 # --------------------------------------------------------------------------
-async def run_signup(pw, supabase) -> bool:
+async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     TOTAL = 9
     captured = {}
     signup_done = False
@@ -235,6 +237,10 @@ async def run_signup(pw, supabase) -> bool:
 
     # 1. Ask rpc.py for an account
     account = rpc.claim("signup")
+    while account and account["address"] in tried:
+        rpc.release(account["address"])
+        account = rpc.claim("signup")
+        
     if account is None:
         print("  creating new tempmail account ...")
         await run_py(TEMPMAIL_SCRIPT, "new")  # inserts into DB
@@ -242,7 +248,7 @@ async def run_signup(pw, supabase) -> bool:
         
     if account is None:
         print("[!] No account available.")
-        return False
+        return False, None
 
     email, password = account["address"], account["password"]
     print(f"  email    : {email}")
@@ -259,7 +265,7 @@ async def run_signup(pw, supabase) -> bool:
     except Exception as e:
         print(f"[!] {e}")
         rpc.release(email)
-        return False
+        return False, email
     print(f"  image    : {image_path}")
 
     browser = await pw.chromium.launch(
@@ -295,7 +301,7 @@ async def run_signup(pw, supabase) -> bool:
         await fill_first_match(page, ['input[aria-label="Email"]'], email, "email")
         url_before = page.url
         await click_first_match(page, CONTINUE_SELECTORS)
-        if not await wait_for_redirect(page, url_before): return False
+        if not await wait_for_redirect(page, url_before): return False, email
 
         step_header(3, TOTAL, "Password")
         await page.wait_for_load_state("domcontentloaded")
@@ -303,14 +309,14 @@ async def run_signup(pw, supabase) -> bool:
         await fill_first_match(page, ['input[aria-label="Confirm Password"]'], password, "confirm password")
         url_before = page.url
         await click_first_match(page, CONTINUE_SELECTORS)
-        if not await wait_for_redirect(page, url_before): return False
+        if not await wait_for_redirect(page, url_before): return False, email
 
         step_header(4, TOTAL, "Handle")
         await page.wait_for_load_state("domcontentloaded")
         await fill_first_match(page, ['input[aria-label="Handle"]'], handle, "handle")
         url_before = page.url
         await click_first_match(page, CONTINUE_SELECTORS)
-        if not await wait_for_redirect(page, url_before): return False
+        if not await wait_for_redirect(page, url_before): return False, email
 
         step_header(5, TOTAL, "Profile")
         await page.wait_for_load_state("domcontentloaded")
@@ -318,7 +324,7 @@ async def run_signup(pw, supabase) -> bool:
         await fill_first_match(page, ['input[aria-label="Display Name"]'], handle, "display name")
 
         step_header(6, TOTAL, "Intermediate pages")
-        if not await advance_post_profile_steps(page, POST_PROFILE_STEPS): return False
+        if not await advance_post_profile_steps(page, POST_PROFILE_STEPS): return False, email
 
         step_header(7, TOTAL, "Final Settle")
         await wait_with_progress(page, PRE_FINAL_WAIT_MS, "settle on final page")
@@ -330,7 +336,7 @@ async def run_signup(pw, supabase) -> bool:
             if await wait_for_leave_signup(page, REDIRECT_TIMEOUT_S):
                 signup_done = True
             else:
-                return False
+                return False, email
 
         step_header(9, TOTAL, "Wallet capture + DB update")
         await capture_wallet_apis(page, captured)
@@ -359,18 +365,37 @@ async def run_signup(pw, supabase) -> bool:
     if not signup_done:
         print(f"\n[!] Signup failed for {email} - released for retry")
 
-    return signup_done
+    return signup_done, email
 
 
 async def main() -> None:
     url, key = load_supabase_creds()
     supabase = create_client(url, key)
+    
+    tried = set()
+    ok = 0
+    failed = 0
+    exhausted = False
+
     print("[*] Audius signup")
-    async with async_playwright() as pw:
-        ok = await run_signup(pw, supabase)
-    print()
-    if ok: print("[+] Signup finished successfully")
-    else: print("[!] Signup failed")
+    for i in range(1, MAX_RUNS + 1):
+        print(f"\n{'='*60}\n[*] Run {i}/{MAX_RUNS}\n{'='*60}")
+        async with async_playwright() as pw:
+            success, address = await run_signup(pw, supabase, tried)
+
+        if address is None:
+            print("[*] No account available (creation failed).")
+            exhausted = True
+            break
+
+        tried.add(address)
+        if success: ok += 1
+        else: failed += 1
+        print(f"[*] Run {i} finished")
+
+    print(f"\n{'='*60}\n[*] Summary: {ok} ok, {failed} failed, {len(tried)} tried\n{'='*60}")
+    if exhausted:
+        print("[*] Stopped early - no account available.")
 
 if __name__ == "__main__":
     asyncio.run(main())
