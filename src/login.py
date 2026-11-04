@@ -79,7 +79,21 @@ def load_supabase_creds() -> tuple[str, str]:
 
 def read_user_agent() -> str:
     uas = [u.strip() for u in UA_FILE.read_text().splitlines() if u.strip()]
-    return random.choice(uas)
+
+    allowed = [
+        ua for ua in uas
+        if any(k in ua.lower() for k in ("chrome", "firefox", "edg"))
+    ]
+
+    if not allowed:
+        print("[!] No Chrome/Firefox/Edge UAs found - using default Chrome UA")
+        return (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+
+    return random.choice(allowed)
 
 
 def generate_handle() -> str:
@@ -196,13 +210,12 @@ def build_request_handler(captured: dict):
     def handler(request):
         if not API_PATTERN.search(request.url):
             return
-            
-        # Extract user_id from URL (e.g., /v1/users/NzZa3b4/coins)
+
         if "user_id" not in captured:
             m = re.search(r"/users/([^/?]+)", request.url)
             if m:
                 captured["user_id"] = m.group(1)
-                
+
         if captured.get("api_key"):
             return
 
@@ -211,11 +224,11 @@ def build_request_handler(captured: dict):
         hdrs = {k.lower(): v for k, v in request.headers.items()}
         enc_dm = hdrs.get("encoded-data-message")
         enc_ds = hdrs.get("encoded-data-signature")
-        
+
         if api_key and enc_dm and enc_ds:
             captured.update({
-                "api_key": api_key, 
-                "encoded_dm": enc_dm, 
+                "api_key": api_key,
+                "encoded_dm": enc_dm,
                 "encoded_ds": enc_ds
             })
             print("[*] Wallet API credentials captured")
@@ -227,7 +240,6 @@ def build_request_handler(captured: dict):
 
 
 async def heartbeat_loop(supabase, address: str):
-    """Silently pings the DB every 30s to keep the lease alive."""
     while True:
         await asyncio.sleep(30)
         try:
@@ -376,7 +388,6 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         await page.route("**/*", handle_route)
         page.on("request", build_request_handler(captured))
 
-        # 2. Start heartbeat for this specific account
         ping_task = asyncio.create_task(heartbeat_loop(supabase, address))
 
         # --- Login flow ---
@@ -420,13 +431,11 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             print("[!] Could not click OTP submit:", e)
             return False, address
 
-        # --- Wait for redirect after OTP ---
         for _ in range(60):
             if "/feed" in page.url or "/signup" in page.url:
                 break
             await page.wait_for_timeout(1000)
 
-        # --- Detect incomplete signup ---
         if "/signup/pick-handle" in page.url:
             print(f"[*] Detected incomplete signup at {page.url}")
             if not await complete_incomplete_signup(page):
@@ -449,17 +458,15 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         # --- Wallet capture ---
         print("[*] Opening https://audius.co/wallet ...")
         await page.goto("https://audius.co/wallet", wait_until="domcontentloaded", timeout=60_000)
-        
-        # Wait for API credentials to be captured
+
         for _ in range(60):
-            if captured.get("api_key"): 
+            if captured.get("api_key"):
                 break
             await page.wait_for_timeout(500)
 
         # --- Extract Handle from DOM (wait up to 20s) ---
         print("[*] Extracting handle from wallet page ...")
         try:
-            # Look for an anchor with data-discover="true" that contains an '@' in its text
             handle_locator = page.locator('a[data-discover="true"]').filter(has_text="@").first
             await handle_locator.wait_for(state="visible", timeout=20_000)
             text = await handle_locator.inner_text()
