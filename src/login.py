@@ -18,7 +18,6 @@ import rpc
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR   = SCRIPT_DIR.parent
 DB_FILE         = ROOT_DIR / "db.txt"
-UA_FILE         = ROOT_DIR / "user_agents.txt"
 NAME_FILE       = ROOT_DIR / "name.txt"
 TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
 IMG_SCRIPT      = SCRIPT_DIR / "img.py"
@@ -27,6 +26,23 @@ MAX_RUNS = 10
 API_PATTERN = re.compile(
     r"https?://api\.audius\.co/(?:v1/)?users/[^/]+/(?:coins|connected_wallets)"
 )
+
+# --- Desktop Chrome UA pool (no file dependency) ---
+DESKTOP_CHROME_UAS = [
+    # Windows 10/11
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    # macOS (Intel)
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    # Linux x86_64
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+]
 
 LOGIN_BUTTON_SELECTORS = [
     'button[type="submit"].harmony-1e68p2w',
@@ -78,22 +94,7 @@ def load_supabase_creds() -> tuple[str, str]:
 
 
 def read_user_agent() -> str:
-    uas = [u.strip() for u in UA_FILE.read_text().splitlines() if u.strip()]
-
-    allowed = [
-        ua for ua in uas
-        if any(k in ua.lower() for k in ("chrome", "firefox", "edg"))
-    ]
-
-    if not allowed:
-        print("[!] No Chrome/Firefox/Edge UAs found - using default Chrome UA")
-        return (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-
-    return random.choice(allowed)
+    return random.choice(DESKTOP_CHROME_UAS)
 
 
 def generate_handle() -> str:
