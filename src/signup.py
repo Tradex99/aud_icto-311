@@ -57,6 +57,23 @@ IMAGE_CLICK_SELECTORS = [
     'button[aria-label="Upload a profile photo"]', 'label:has(img)',
 ]
 
+# Fallback desktop UAs (Chrome, Firefox, Edge) in case user_agents.txt is empty/missing
+DESKTOP_FALLBACK_UAS = [
+    # Chrome
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+    # Firefox
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:132.0) Gecko/20100101 Firefox/132.0",
+    "Mozilla/5.0 (X11; Linux x86_64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    # Edge
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0",
+]
+
 
 def load_supabase_creds() -> tuple[str, str]:
     text = DB_FILE.read_text()
@@ -64,13 +81,33 @@ def load_supabase_creds() -> tuple[str, str]:
     m_key = re.search(r'SUPABASE_KEY\s*=\s*["\']([^"\']+)["\']', text)
     return m_url.group(1), m_key.group(1)
 
+
 def read_user_agent() -> str:
-    uas = [u.strip() for u in UA_FILE.read_text().splitlines() if u.strip()]
-    return random.choice(uas)
+    uas = []
+    if UA_FILE.exists():
+        uas = [u.strip() for u in UA_FILE.read_text().splitlines() if u.strip()]
+
+    # Filter: must be Chrome/Firefox/Edge, AND must NOT be mobile
+    allowed = []
+    for ua in uas:
+        ua_lower = ua.lower()
+        # Exclude mobile
+        if any(mob in ua_lower for mob in ("android", "mobile", "iphone", "ipad", "ipod")):
+            continue
+        # Include only Chrome, Firefox, Edge
+        if any(browser in ua_lower for browser in ("chrome", "firefox", "edg")):
+            allowed.append(ua)
+
+    if not allowed:
+        return random.choice(DESKTOP_FALLBACK_UAS)
+
+    return random.choice(allowed)
+
 
 def generate_handle() -> str:
     names = [n.strip() for n in NAME_FILE.read_text().splitlines() if n.strip()]
     return f"{random.choice(names)}{random.randint(100, 999)}"
+
 
 async def run_py(script: Path, *args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
@@ -82,8 +119,10 @@ async def run_py(script: Path, *args: str) -> str:
         raise RuntimeError(f"{script.name} exited {proc.returncode}: {stderr.decode().strip()}")
     return stdout.decode()
 
+
 def step_header(n: int, total: int, title: str) -> None:
     print(f"\n[{n}/{total}] {title}")
+
 
 async def wait_with_progress(page, total_ms: int, label: str) -> None:
     steps = total_ms // 1000
@@ -96,6 +135,7 @@ async def wait_with_progress(page, total_ms: int, label: str) -> None:
         await page.wait_for_timeout(1000)
         if i % 5 == 0 or i == steps: print(f"    [{i}/{steps}] {page.url}")
 
+
 async def wait_for_redirect(page, from_url: str, max_seconds: int = 20) -> bool:
     for i in range(max_seconds):
         if page.url != from_url:
@@ -105,6 +145,7 @@ async def wait_for_redirect(page, from_url: str, max_seconds: int = 20) -> bool:
     print(f"  [!] no redirect ({page.url})")
     return False
 
+
 async def wait_for_leave_signup(page, max_seconds: int = 60) -> bool:
     for i in range(max_seconds):
         if "/signup" not in page.url:
@@ -112,6 +153,7 @@ async def wait_for_leave_signup(page, max_seconds: int = 60) -> bool:
             return True
         await page.wait_for_timeout(1000)
     return False
+
 
 async def click_first_match(page, selectors: list[str], per_selector_timeout: int = 15_000) -> str:
     for sel in selectors:
@@ -125,6 +167,7 @@ async def click_first_match(page, selectors: list[str], per_selector_timeout: in
             continue
     raise RuntimeError(f"None matched: {selectors}")
 
+
 async def fill_first_match(page, selectors: list[str], value: str, label: str = "field") -> str:
     for sel in selectors:
         try:
@@ -136,6 +179,7 @@ async def fill_first_match(page, selectors: list[str], value: str, label: str = 
         except Exception:
             continue
     raise RuntimeError(f"Could not find input for {label}")
+
 
 async def upload_profile_image(page, image_path: str) -> None:
     for sel in IMAGE_INPUT_SELECTORS:
@@ -161,17 +205,36 @@ async def upload_profile_image(page, image_path: str) -> None:
             continue
     raise RuntimeError("Could not upload profile image")
 
+
 def build_request_handler(captured: dict):
     def handler(request):
-        if captured or not API_PATTERN.search(request.url): return
+        if not API_PATTERN.search(request.url): 
+            return
+            
+        # Extract user_id from URL (e.g., /v1/users/NzZa3b4/coins)
+        if "user_id" not in captured:
+            m = re.search(r"/users/([^/?]+)", request.url)
+            if m:
+                captured["user_id"] = m.group(1)
+
+        if captured.get("api_key"): 
+            return
+
         qs = parse_qs(urlparse(request.url).query)
         api_key = qs.get("api_key", [None])[0]
         hdrs = {k.lower(): v for k, v in request.headers.items()}
         enc_dm, enc_ds = hdrs.get("encoded-data-message"), hdrs.get("encoded-data-signature")
+        
         if api_key and enc_dm and enc_ds:
-            captured.update({"api_key": api_key, "encoded_dm": enc_dm, "encoded_ds": enc_ds})
+            captured.update({
+                "api_key": api_key, 
+                "encoded_dm": enc_dm, 
+                "encoded_ds": enc_ds
+            })
             print("  captured wallet API credentials")
+            print(f"    user_id          : {captured.get('user_id', 'Unknown')}")
     return handler
+
 
 async def capture_wallet_apis(page, captured: dict) -> bool:
     for attempt in (1, 2):
@@ -180,9 +243,10 @@ async def capture_wallet_apis(page, captured: dict) -> bool:
         else:
             await page.reload(wait_until="domcontentloaded", timeout=60_000)
         for _ in range(30):
-            if captured: return True
+            if captured.get("api_key"): return True
             await page.wait_for_timeout(500)
     return False
+
 
 async def advance_post_profile_steps(page, steps: list[tuple[str, str]]) -> bool:
     for path_frag, desc in steps:
@@ -201,6 +265,7 @@ async def advance_post_profile_steps(page, steps: list[tuple[str, str]]) -> bool
             return False
     return True
 
+
 async def shutdown_browser(page, context, browser) -> None:
     try: await page.wait_for_timeout(500)
     except: pass
@@ -210,6 +275,7 @@ async def shutdown_browser(page, context, browser) -> None:
     except: pass
     try: await browser.close()
     except: pass
+
 
 async def heartbeat_loop(supabase, address: str):
     while True:
@@ -341,11 +407,23 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         step_header(9, TOTAL, "Wallet capture + DB update")
         await capture_wallet_apis(page, captured)
 
-        # 3. Save credentials directly to the assigned row
-        payload = {"register": "yes"}
+        # 3. Save credentials, handle, and user_id directly to the assigned row
+        payload = {
+            "register": "yes",
+            "handle": handle
+        }
+        
         if captured:
-            payload.update({"api_key": captured["api_key"], "encoded_dm": captured["encoded_dm"], "encoded_ds": captured["encoded_ds"]})
-            print(f"  saved credentials to DB")
+            payload.update({
+                "api_key": captured["api_key"], 
+                "encoded_dm": captured["encoded_dm"], 
+                "encoded_ds": captured["encoded_ds"]
+            })
+            if "user_id" in captured:
+                payload["user_id"] = captured["user_id"]
+            print(f"  saved credentials and handle to DB")
+        else:
+            print(f"  saved handle to DB (no wallet credentials)")
         
         supabase.table("audius").update(payload).eq("address", email).execute()
         print(f"  marked {email} register='yes'")
