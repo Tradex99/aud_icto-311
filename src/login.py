@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 """
 login.py - Audius login + wallet-API credential capture.
-
-Handles incomplete signups: if OTP lands on /signup/pick-handle (account
-was created via signup.py but the wizard wasn't finished), this script
-completes the profile wizard before capturing wallet credentials.
 """
 
 import asyncio
@@ -198,20 +194,35 @@ def _shorten(value: str, head: int = 20, tail: int = 6) -> str:
 
 def build_request_handler(captured: dict):
     def handler(request):
-        if captured or not API_PATTERN.search(request.url):
+        if not API_PATTERN.search(request.url):
             return
+            
+        # Extract user_id from URL (e.g., /v1/users/NzZa3b4/coins)
+        if "user_id" not in captured:
+            m = re.search(r"/users/([^/?]+)", request.url)
+            if m:
+                captured["user_id"] = m.group(1)
+                
+        if captured.get("api_key"):
+            return
+
         qs = parse_qs(urlparse(request.url).query)
         api_key = qs.get("api_key", [None])[0]
         hdrs = {k.lower(): v for k, v in request.headers.items()}
         enc_dm = hdrs.get("encoded-data-message")
         enc_ds = hdrs.get("encoded-data-signature")
-        if not (api_key and enc_dm and enc_ds):
-            return
-        captured.update({"api_key": api_key, "encoded_dm": enc_dm, "encoded_ds": enc_ds})
-        print("[*] Wallet API credentials captured")
-        print(f"    api_key          : {api_key}")
-        print(f"    Encoded-Data-Msg : {enc_dm}")
-        print(f"    Encoded-Data-Sig : {_shorten(enc_ds)}")
+        
+        if api_key and enc_dm and enc_ds:
+            captured.update({
+                "api_key": api_key, 
+                "encoded_dm": enc_dm, 
+                "encoded_ds": enc_ds
+            })
+            print("[*] Wallet API credentials captured")
+            print(f"    user_id          : {captured.get('user_id', 'Unknown')}")
+            print(f"    api_key          : {api_key}")
+            print(f"    Encoded-Data-Msg : {enc_dm}")
+            print(f"    Encoded-Data-Sig : {_shorten(enc_ds)}")
     return handler
 
 
@@ -231,16 +242,10 @@ async def heartbeat_loop(supabase, address: str):
 # Complete an incomplete signup wizard
 # --------------------------------------------------------------------------
 async def complete_incomplete_signup(page) -> bool:
-    """
-    Called when OTP lands on /signup/pick-handle (account was created but
-    profile wizard wasn't finished). Walks the wizard to completion.
-    """
     print("[*] Detected incomplete signup - completing wizard...")
-
     await page.wait_for_load_state("domcontentloaded", timeout=60_000)
     await page.wait_for_timeout(2000)
 
-    # --- Prepare handle + image ---
     try:
         handle = generate_handle()
     except (FileNotFoundError, RuntimeError) as e:
@@ -262,15 +267,10 @@ async def complete_incomplete_signup(page) -> bool:
         return False
     print(f"  image    : {image_path}")
 
-    # --- Step 1: handle page ---
     if "/signup/pick-handle" in page.url:
         print(f"  [handle] filling handle (current: {page.url})")
         try:
-            await fill_first_match(
-                page,
-                ['input[aria-label="Handle"]', 'input[name="handle"]'],
-                handle, label="handle",
-            )
+            await fill_first_match(page, ['input[aria-label="Handle"]', 'input[name="handle"]'], handle, label="handle")
             url_before = page.url
             await click_first_match(page, CONTINUE_SELECTORS)
             if not await wait_for_redirect(page, url_before):
@@ -280,16 +280,11 @@ async def complete_incomplete_signup(page) -> bool:
             return False
         await page.wait_for_load_state("domcontentloaded", timeout=60_000)
 
-    # --- Step 2: profile page ---
     if "/signup/finish-profile" in page.url:
         print(f"  [profile] image + display name (current: {page.url})")
         try:
             await upload_profile_image(page, image_path)
-            await fill_first_match(
-                page,
-                ['input[aria-label="Display Name"]', 'input[name="displayName"]'],
-                handle, label="display name",
-            )
+            await fill_first_match(page, ['input[aria-label="Display Name"]', 'input[name="displayName"]'], handle, label="display name")
             url_before = page.url
             await click_first_match(page, CONTINUE_SELECTORS)
             if not await wait_for_redirect(page, url_before):
@@ -299,7 +294,6 @@ async def complete_incomplete_signup(page) -> bool:
             return False
         await page.wait_for_load_state("domcontentloaded", timeout=60_000)
 
-    # --- Step 3: genres page ---
     if "/signup/select-genres" in page.url:
         print(f"  [genres] continuing (current: {page.url})")
         await page.wait_for_timeout(3000)
@@ -313,7 +307,6 @@ async def complete_incomplete_signup(page) -> bool:
             return False
         await page.wait_for_load_state("domcontentloaded", timeout=60_000)
 
-    # --- Step 4: artists page ---
     if "/signup/select-artists" in page.url:
         print(f"  [artists] continuing (current: {page.url})")
         await page.wait_for_timeout(3000)
@@ -324,7 +317,6 @@ async def complete_incomplete_signup(page) -> bool:
             return False
         await page.wait_for_timeout(2000)
 
-    # --- Step 5: app-cta auto-redirect ---
     print(f"  [final] waiting for auto-redirect (current: {page.url})")
     if not await wait_for_leave_signup(page, max_seconds=60):
         return False
@@ -337,7 +329,6 @@ async def complete_incomplete_signup(page) -> bool:
 # Main worker
 # --------------------------------------------------------------------------
 async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
-    # 1. Ask rpc.py for an account
     account = rpc.claim("login")
     while account and account["address"] in tried:
         rpc.release(account["address"])
@@ -445,7 +436,6 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
                 print(f"[!] Wizard completed but not on /feed: {page.url}")
                 return False, address
             print("[+] Wizard completed - now on /feed")
-            # Give session a moment to settle before wallet
             await page.wait_for_timeout(2000)
         elif "/signup" in page.url:
             print(f"[!] Unexpected signup URL: {page.url}")
@@ -459,19 +449,39 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         # --- Wallet capture ---
         print("[*] Opening https://audius.co/wallet ...")
         await page.goto("https://audius.co/wallet", wait_until="domcontentloaded", timeout=60_000)
+        
+        # Wait for API credentials to be captured
         for _ in range(60):
-            if captured:
+            if captured.get("api_key"): 
                 break
             await page.wait_for_timeout(500)
 
-        if captured:
-            # 3. Save credentials directly to the assigned row
-            supabase.table("audius").update({
+        # --- Extract Handle from DOM (wait up to 20s) ---
+        print("[*] Extracting handle from wallet page ...")
+        try:
+            # Look for an anchor with data-discover="true" that contains an '@' in its text
+            handle_locator = page.locator('a[data-discover="true"]').filter(has_text="@").first
+            await handle_locator.wait_for(state="visible", timeout=20_000)
+            text = await handle_locator.inner_text()
+            captured["handle"] = text.replace("@", "").strip()
+            print(f"[*] Extracted handle: {captured['handle']}")
+        except Exception as e:
+            print(f"[!] Could not extract handle after 20s: {e}")
+
+        # --- Save to DB ---
+        if captured.get("api_key"):
+            update_payload = {
                 "api_key": captured["api_key"],
                 "encoded_dm": captured["encoded_dm"],
                 "encoded_ds": captured["encoded_ds"],
-            }).eq("address", address).execute()
-            print("[+] Saved credentials to DB")
+            }
+            if "user_id" in captured:
+                update_payload["user_id"] = captured["user_id"]
+            if "handle" in captured:
+                update_payload["handle"] = captured["handle"]
+
+            supabase.table("audius").update(update_payload).eq("address", address).execute()
+            print("[+] Saved all credentials to DB")
             success = True
         else:
             print("[!] No target API captured within 30 s")
@@ -513,16 +523,13 @@ async def main() -> None:
             break
 
         tried.add(address)
-        if success:
-            ok += 1
-        else:
-            failed += 1
+        if success: ok += 1
+        else: failed += 1
         print(f"[*] Run {i} finished")
 
     print(f"\n{'='*60}\n[*] Summary: {ok} ok, {failed} failed, {len(tried)} tried\n{'='*60}")
     if exhausted:
         print("[*] Stopped early - pool exhausted.")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
