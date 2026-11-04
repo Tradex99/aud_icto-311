@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 login.py - Audius login + wallet-API credential capture.
+
+Handles incomplete signups: if OTP lands on /signup/pick-handle (account
+was created via signup.py but the wizard wasn't finished), this script
+completes the profile wizard before capturing wallet credentials.
 """
 
 import asyncio
@@ -19,7 +23,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR   = SCRIPT_DIR.parent
 DB_FILE         = ROOT_DIR / "db.txt"
 UA_FILE         = ROOT_DIR / "user_agents.txt"
+NAME_FILE       = ROOT_DIR / "name.txt"
 TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
+IMG_SCRIPT      = SCRIPT_DIR / "img.py"
 
 MAX_RUNS = 10
 API_PATTERN = re.compile(
@@ -41,6 +47,29 @@ OTP_BUTTON_SELECTORS = [
     'button:has-text("Submit")',
 ]
 
+CONTINUE_SELECTORS = [
+    'button[type="submit"]:has-text("Continue")',
+    'button[type="submit"]',
+    'button:has-text("Continue")',
+    'button:has-text("Next")',
+]
+
+IMAGE_INPUT_SELECTORS = [
+    'xpath=/html/body/div[1]/div[1]/div[4]/div/form/div[1]/div[2]/div[1]/div[2]/div[1]/input',
+    'input[type="file"][accept*="image/jpeg"]',
+    'input[type="file"][accept*="image"]',
+    'input[type="file"]',
+]
+
+IMAGE_CLICK_SELECTORS = [
+    'img.harmony-70oscu',
+    'div.harmony-3ptp8e',
+    'img[src^="data:image"]',
+    'img[src^="blob:"]',
+    'button[aria-label="Upload a profile photo"]',
+    'label:has(img)',
+]
+
 
 # --------------------------------------------------------------------------
 # Helpers
@@ -51,9 +80,31 @@ def load_supabase_creds() -> tuple[str, str]:
     m_key = re.search(r'SUPABASE_KEY\s*=\s*["\']([^"\']+)["\']', text)
     return m_url.group(1), m_key.group(1)
 
+
 def read_user_agent() -> str:
     uas = [u.strip() for u in UA_FILE.read_text().splitlines() if u.strip()]
     return random.choice(uas)
+
+
+def generate_handle() -> str:
+    if not NAME_FILE.exists():
+        raise FileNotFoundError(f"name.txt not found at {NAME_FILE}")
+    names = [n.strip() for n in NAME_FILE.read_text().splitlines() if n.strip()]
+    if not names:
+        raise RuntimeError(f"No names found in {NAME_FILE}")
+    return f"{random.choice(names)}{random.randint(100, 999)}"
+
+
+async def run_py(script: Path, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "python3", str(script), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"{script.name} exited {proc.returncode}: {stderr.decode().strip()}")
+    return stdout.decode()
+
 
 async def run_tempmail_inbox(address: str) -> str:
     proc = await asyncio.create_subprocess_exec(
@@ -62,6 +113,7 @@ async def run_tempmail_inbox(address: str) -> str:
     )
     stdout, _ = await proc.communicate()
     return stdout.decode()
+
 
 async def click_first_match(page, selectors: list[str], per_selector_timeout: int = 10_000) -> str:
     last_err = None
@@ -77,8 +129,72 @@ async def click_first_match(page, selectors: list[str], per_selector_timeout: in
             continue
     raise RuntimeError(f"None matched: {selectors} (err: {last_err})")
 
+
+async def fill_first_match(page, selectors: list[str], value: str,
+                           per_selector_timeout: int = 15_000,
+                           label: str = "field") -> str:
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=per_selector_timeout)
+            await loc.fill(value)
+            print(f"   filled {label} via: {sel}")
+            return sel
+        except Exception:
+            continue
+    raise RuntimeError(f"Could not find input for {label}: {selectors}")
+
+
+async def upload_profile_image(page, image_path: str) -> None:
+    for sel in IMAGE_INPUT_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="attached", timeout=8_000)
+            await loc.set_input_files(image_path)
+            print(f"   uploaded image via input: {sel}")
+            return
+        except Exception:
+            continue
+    for sel in IMAGE_CLICK_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=5_000)
+            async with page.expect_file_chooser(timeout=5_000) as fc_info:
+                await loc.click()
+            fc = await fc_info.value
+            await fc.set_files(image_path)
+            print(f"   uploaded image via click: {sel}")
+            return
+        except Exception:
+            continue
+    raise RuntimeError("Could not upload profile image via any selector")
+
+
+async def wait_for_redirect(page, from_url: str, max_seconds: int = 20) -> bool:
+    for i in range(max_seconds):
+        if page.url != from_url:
+            print(f"   -> redirected to {page.url} ({i + 1}s)")
+            return True
+        await page.wait_for_timeout(1000)
+    print(f"   [!] no redirect after {max_seconds}s (still {page.url})")
+    return False
+
+
+async def wait_for_leave_signup(page, max_seconds: int = 60) -> bool:
+    for i in range(max_seconds):
+        if "/signup" not in page.url:
+            print(f"   -> left /signup: {page.url} ({i + 1}s)")
+            return True
+        if i % 5 == 0 and i > 0:
+            print(f"     [{i}s] still {page.url}")
+        await page.wait_for_timeout(1000)
+    print(f"   [!] still on /signup after {max_seconds}s: {page.url}")
+    return False
+
+
 def _shorten(value: str, head: int = 20, tail: int = 6) -> str:
     return f"{value[:head]}...{value[-tail:]}" if len(value) > head+tail+3 else value
+
 
 def build_request_handler(captured: dict):
     def handler(request):
@@ -98,6 +214,7 @@ def build_request_handler(captured: dict):
         print(f"    Encoded-Data-Sig : {_shorten(enc_ds)}")
     return handler
 
+
 async def heartbeat_loop(supabase, address: str):
     """Silently pings the DB every 30s to keep the lease alive."""
     while True:
@@ -111,16 +228,121 @@ async def heartbeat_loop(supabase, address: str):
 
 
 # --------------------------------------------------------------------------
+# Complete an incomplete signup wizard
+# --------------------------------------------------------------------------
+async def complete_incomplete_signup(page) -> bool:
+    """
+    Called when OTP lands on /signup/pick-handle (account was created but
+    profile wizard wasn't finished). Walks the wizard to completion.
+    """
+    print("[*] Detected incomplete signup - completing wizard...")
+
+    await page.wait_for_load_state("domcontentloaded", timeout=60_000)
+    await page.wait_for_timeout(2000)
+
+    # --- Prepare handle + image ---
+    try:
+        handle = generate_handle()
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"[!] {e}")
+        return False
+    print(f"  handle   : {handle}")
+
+    if not IMG_SCRIPT.exists():
+        print(f"[!] img.py not found at {IMG_SCRIPT}")
+        return False
+    try:
+        img_out = (await run_py(IMG_SCRIPT)).strip()
+        m = re.search(r"Image saved as:\s*(.+)", img_out)
+        if not m:
+            raise RuntimeError(f"Image path not found in img.py output: {img_out!r}")
+        image_path = m.group(1).strip()
+    except RuntimeError as e:
+        print(f"[!] {e}")
+        return False
+    print(f"  image    : {image_path}")
+
+    # --- Step 1: handle page ---
+    if "/signup/pick-handle" in page.url:
+        print(f"  [handle] filling handle (current: {page.url})")
+        try:
+            await fill_first_match(
+                page,
+                ['input[aria-label="Handle"]', 'input[name="handle"]'],
+                handle, label="handle",
+            )
+            url_before = page.url
+            await click_first_match(page, CONTINUE_SELECTORS)
+            if not await wait_for_redirect(page, url_before):
+                return False
+        except RuntimeError as e:
+            print(f"  [!] {e}")
+            return False
+        await page.wait_for_load_state("domcontentloaded", timeout=60_000)
+
+    # --- Step 2: profile page ---
+    if "/signup/finish-profile" in page.url:
+        print(f"  [profile] image + display name (current: {page.url})")
+        try:
+            await upload_profile_image(page, image_path)
+            await fill_first_match(
+                page,
+                ['input[aria-label="Display Name"]', 'input[name="displayName"]'],
+                handle, label="display name",
+            )
+            url_before = page.url
+            await click_first_match(page, CONTINUE_SELECTORS)
+            if not await wait_for_redirect(page, url_before):
+                return False
+        except RuntimeError as e:
+            print(f"  [!] {e}")
+            return False
+        await page.wait_for_load_state("domcontentloaded", timeout=60_000)
+
+    # --- Step 3: genres page ---
+    if "/signup/select-genres" in page.url:
+        print(f"  [genres] continuing (current: {page.url})")
+        await page.wait_for_timeout(3000)
+        try:
+            url_before = page.url
+            await click_first_match(page, CONTINUE_SELECTORS)
+            if not await wait_for_redirect(page, url_before):
+                return False
+        except RuntimeError as e:
+            print(f"  [!] {e}")
+            return False
+        await page.wait_for_load_state("domcontentloaded", timeout=60_000)
+
+    # --- Step 4: artists page ---
+    if "/signup/select-artists" in page.url:
+        print(f"  [artists] continuing (current: {page.url})")
+        await page.wait_for_timeout(3000)
+        try:
+            await click_first_match(page, CONTINUE_SELECTORS)
+        except RuntimeError as e:
+            print(f"  [!] {e}")
+            return False
+        await page.wait_for_timeout(2000)
+
+    # --- Step 5: app-cta auto-redirect ---
+    print(f"  [final] waiting for auto-redirect (current: {page.url})")
+    if not await wait_for_leave_signup(page, max_seconds=60):
+        return False
+
+    print(f"  [done] signed in: {page.url}")
+    return True
+
+
+# --------------------------------------------------------------------------
 # Main worker
 # --------------------------------------------------------------------------
 async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     # 1. Ask rpc.py for an account
     account = rpc.claim("login")
     while account and account["address"] in tried:
-        # Already tried this session, put it back and grab another
         rpc.release(account["address"])
         account = rpc.claim("login")
-        
+
     if account is None:
         return False, None
 
@@ -149,7 +371,9 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             },
         )
-        await context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
         page = await context.new_page()
 
         async def handle_route(route):
@@ -177,7 +401,10 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             return False, address
 
         try:
-            await page.wait_for_url("https://audius.co/signin/confirm-email", wait_until="load", timeout=60_000)
+            await page.wait_for_url(
+                "https://audius.co/signin/confirm-email",
+                wait_until="load", timeout=60_000,
+            )
             await page.wait_for_timeout(2000)
         except Exception:
             pass
@@ -185,7 +412,8 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         try:
             stdout = await run_tempmail_inbox(address)
             m = re.search(r"\d{3}\s\d{3}", stdout)
-            if not m: raise RuntimeError(f"OTP not found: {stdout!r}")
+            if not m:
+                raise RuntimeError(f"OTP not found: {stdout!r}")
             otp = m.group(0)
             print("[*] OTP:", otp)
         except Exception as e:
@@ -194,26 +422,46 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
 
         await page.fill('input[aria-label="Code"]', otp)
         await page.wait_for_timeout(1000)
-        
+
         try:
             await click_first_match(page, OTP_BUTTON_SELECTORS)
         except RuntimeError as e:
             print("[!] Could not click OTP submit:", e)
             return False, address
 
-        try:
-            await page.wait_for_url("https://audius.co/feed", wait_until="load", timeout=60_000)
-            print("[+] Login success - feed loaded")
-        except Exception:
-            if "https://audius.co/feed" not in page.url:
-                print("[!] Failed to reach feed. URL:", page.url)
+        # --- Wait for redirect after OTP ---
+        for _ in range(60):
+            if "/feed" in page.url or "/signup" in page.url:
+                break
+            await page.wait_for_timeout(1000)
+
+        # --- Detect incomplete signup ---
+        if "/signup/pick-handle" in page.url:
+            print(f"[*] Detected incomplete signup at {page.url}")
+            if not await complete_incomplete_signup(page):
+                print("[!] Failed to complete signup wizard")
                 return False, address
+            if "/feed" not in page.url:
+                print(f"[!] Wizard completed but not on /feed: {page.url}")
+                return False, address
+            print("[+] Wizard completed - now on /feed")
+            # Give session a moment to settle before wallet
+            await page.wait_for_timeout(2000)
+        elif "/signup" in page.url:
+            print(f"[!] Unexpected signup URL: {page.url}")
+            return False, address
+        elif "/feed" in page.url:
+            print("[+] Login success - feed loaded")
+        else:
+            print("[!] Unexpected URL:", page.url)
+            return False, address
 
         # --- Wallet capture ---
         print("[*] Opening https://audius.co/wallet ...")
         await page.goto("https://audius.co/wallet", wait_until="domcontentloaded", timeout=60_000)
         for _ in range(60):
-            if captured: break
+            if captured:
+                break
             await page.wait_for_timeout(500)
 
         if captured:
@@ -231,7 +479,6 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     except Exception as e:
         print("[!] Fatal:", e)
     finally:
-        # 4. Stop heartbeat
         if ping_task:
             ping_task.cancel()
         try:
@@ -266,13 +513,16 @@ async def main() -> None:
             break
 
         tried.add(address)
-        if success: ok += 1
-        else: failed += 1
+        if success:
+            ok += 1
+        else:
+            failed += 1
         print(f"[*] Run {i} finished")
 
     print(f"\n{'='*60}\n[*] Summary: {ok} ok, {failed} failed, {len(tried)} tried\n{'='*60}")
     if exhausted:
         print("[*] Stopped early - pool exhausted.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
