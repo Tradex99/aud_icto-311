@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-login.py - Audius login + wallet-API credential capture.
+login.py - Audius login + developer app creation + localStorage capture.
 """
 
 import asyncio
+import json
 import random
 import re
 from pathlib import Path
@@ -23,22 +24,16 @@ TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
 IMG_SCRIPT      = SCRIPT_DIR / "img.py"
 
 MAX_RUNS = 10
-API_PATTERN = re.compile(
-    r"https?://api\.audius\.co/(?:v1/)?users/[^/]+/(?:coins|connected_wallets)"
-)
 
-# --- Desktop Chrome UA pool (no file dependency) ---
+# --- Desktop Chrome UA pool ---
 DESKTOP_CHROME_UAS = [
-    # Windows 10/11
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    # macOS (Intel)
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-    # Linux x86_64
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
@@ -74,12 +69,9 @@ IMAGE_INPUT_SELECTORS = [
 ]
 
 IMAGE_CLICK_SELECTORS = [
-    'img.harmony-70oscu',
-    'div.harmony-3ptp8e',
-    'img[src^="data:image"]',
-    'img[src^="blob:"]',
-    'button[aria-label="Upload a profile photo"]',
-    'label:has(img)',
+    'img.harmony-70oscu', 'div.harmony-3ptp8e',
+    'img[src^="data:image"]', 'img[src^="blob:"]',
+    'button[aria-label="Upload a profile photo"]', 'label:has(img)',
 ]
 
 
@@ -207,39 +199,6 @@ def _shorten(value: str, head: int = 20, tail: int = 6) -> str:
     return f"{value[:head]}...{value[-tail:]}" if len(value) > head+tail+3 else value
 
 
-def build_request_handler(captured: dict):
-    def handler(request):
-        if not API_PATTERN.search(request.url):
-            return
-
-        if "user_id" not in captured:
-            m = re.search(r"/users/([^/?]+)", request.url)
-            if m:
-                captured["user_id"] = m.group(1)
-
-        if captured.get("api_key"):
-            return
-
-        qs = parse_qs(urlparse(request.url).query)
-        api_key = qs.get("api_key", [None])[0]
-        hdrs = {k.lower(): v for k, v in request.headers.items()}
-        enc_dm = hdrs.get("encoded-data-message")
-        enc_ds = hdrs.get("encoded-data-signature")
-
-        if api_key and enc_dm and enc_ds:
-            captured.update({
-                "api_key": api_key,
-                "encoded_dm": enc_dm,
-                "encoded_ds": enc_ds
-            })
-            print("[*] Wallet API credentials captured")
-            print(f"    user_id          : {captured.get('user_id', 'Unknown')}")
-            print(f"    api_key          : {api_key}")
-            print(f"    Encoded-Data-Msg : {enc_dm}")
-            print(f"    Encoded-Data-Sig : {_shorten(enc_ds)}")
-    return handler
-
-
 async def heartbeat_loop(supabase, address: str):
     while True:
         await asyncio.sleep(30)
@@ -339,6 +298,101 @@ async def complete_incomplete_signup(page) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Developer Settings & App Creation
+# --------------------------------------------------------------------------
+async def create_app_and_extract_credentials(page, captured: dict) -> dict:
+    """Navigates settings -> Manage apps -> Create app -> extracts credentials via network."""
+    print("[*] Navigating to settings...")
+    await page.goto("https://audius.co/settings", wait_until="domcontentloaded", timeout=60_000)
+    await page.wait_for_timeout(3000)
+
+    # Click "Manage your apps"
+    manage_apps_xpath = "/html/body/div[1]/div[1]/div[2]/div[3]/div/div[2]/div/div[1]/div[15]/button"
+    print("  -> clicking 'Manage your apps'")
+    await page.locator(f"xpath={manage_apps_xpath}").click()
+    await page.wait_for_timeout(2000)
+
+    # Click "New"
+    new_btn_xpath = "/html/body/div[5]/div/div/div/div[2]/div/div/div[1]/div/div/div/div/button"
+    print("  -> clicking 'New'")
+    await page.locator(f"xpath={new_btn_xpath}").click()
+    await page.wait_for_timeout(2000)
+
+    app_name = generate_handle()
+
+    # Fill App Name
+    print(f"  -> filling app name: {app_name}")
+    await page.fill('input[aria-label="App Name"]', app_name)
+
+    # Wait for "Create key" button to be ready
+    create_key_xpath = "/html/body/div[5]/div/div/div/div[2]/div/div/div[1]/div/form/div[4]/button[2]"
+    print("  -> waiting for 'Create key' button")
+    await page.locator(f"xpath={create_key_xpath}").wait_for(state="visible", timeout=15_000)
+
+    # Setup network interception listeners *before* clicking Create Key
+    def on_request(request):
+        # 1. Extract API Key & Secret from register-api-key
+        if "/register-api-key" in request.url:
+            m = re.search(r"/developer-apps/0x([a-fA-F0-9]+)/register-api-key", request.url)
+            if m:
+                captured["app_api_key"] = m.group(1)
+                print(f"  -> [NETWORK] Captured app_api_key: {captured['app_api_key']}")
+
+            if request.post_data:
+                try:
+                    body = json.loads(request.post_data)
+                    if "api_secret" in body:
+                        captured["app_api_secret"] = body["api_secret"]
+                        print(f"  -> [NETWORK] Captured app_api_secret: {_shorten(captured['app_api_secret'])}")
+                except Exception:
+                    pass
+
+    async def on_response(response):
+        # 2. Extract Bearer Token from access-keys
+        if "/access-keys" in response.url:
+            try:
+                data = await response.json()
+                if "api_access_key" in data:
+                    captured["app_bearer_token"] = data["api_access_key"]
+                    print(f"  -> [NETWORK] Captured app_bearer_token: {_shorten(captured['app_bearer_token'])}")
+            except Exception:
+                pass
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+
+    # Click "Create key"
+    print("  -> clicking 'Create key'")
+    await page.locator(f"xpath={create_key_xpath}").click()
+
+    # Wait for the network requests to populate the captured data
+    print("  -> waiting for network requests to finish...")
+    for _ in range(30):  # up to 15 seconds
+        if all(k in captured for k in ("app_api_key", "app_api_secret", "app_bearer_token")):
+            break
+        await page.wait_for_timeout(500)
+
+    return {
+        "api_key": captured.get("app_api_key", ""),
+        "api_secret": captured.get("app_api_secret", ""),
+        "bearer_token": captured.get("app_bearer_token", "")
+    }
+
+
+async def extract_local_storage(page) -> dict:
+    """Returns all localStorage data as a dictionary."""
+    print("[*] Extracting localStorage...")
+    try:
+        raw = await page.evaluate("() => JSON.stringify(localStorage)")
+        data = json.loads(raw) if raw else {}
+        print(f"  -> extracted {len(data)} localStorage keys")
+        return data
+    except Exception as e:
+        print(f"[!] Failed to extract localStorage: {e}")
+        return {}
+
+
+# --------------------------------------------------------------------------
 # Main worker
 # --------------------------------------------------------------------------
 async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
@@ -387,7 +441,6 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             except Exception:
                 pass
         await page.route("**/*", handle_route)
-        page.on("request", build_request_handler(captured))
 
         ping_task = asyncio.create_task(heartbeat_loop(supabase, address))
 
@@ -456,17 +509,8 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             print("[!] Unexpected URL:", page.url)
             return False, address
 
-        # --- Wallet capture ---
-        print("[*] Opening https://audius.co/wallet ...")
-        await page.goto("https://audius.co/wallet", wait_until="domcontentloaded", timeout=60_000)
-
-        for _ in range(60):
-            if captured.get("api_key"):
-                break
-            await page.wait_for_timeout(500)
-
-        # --- Extract Handle from DOM (wait up to 20s) ---
-        print("[*] Extracting handle from wallet page ...")
+        # --- Extract Handle from Feed page ---
+        print("[*] Extracting handle from feed page ...")
         try:
             handle_locator = page.locator('a[data-discover="true"]').filter(has_text="@").first
             await handle_locator.wait_for(state="visible", timeout=20_000)
@@ -476,23 +520,32 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         except Exception as e:
             print(f"[!] Could not extract handle after 20s: {e}")
 
+        # --- Developer App Creation & Credentials (via Network) ---
+        app_data = await create_app_and_extract_credentials(page, captured)
+
+        # --- Local Storage Extraction ---
+        local_db = await extract_local_storage(page)
+
         # --- Save to DB ---
-        if captured.get("api_key"):
-            update_payload = {
-                "api_key": captured["api_key"],
-                "encoded_dm": captured["encoded_dm"],
-                "encoded_ds": captured["encoded_ds"],
-            }
-            if "user_id" in captured:
-                update_payload["user_id"] = captured["user_id"]
+        if app_data or local_db:
+            update_payload = {}
+
+            if app_data:
+                update_payload["app_data"] = app_data
+                print("[+] App credentials ready to save")
+            if local_db:
+                update_payload["local_db"] = local_db
             if "handle" in captured:
                 update_payload["handle"] = captured["handle"]
 
-            supabase.table("audius").update(update_payload).eq("address", address).execute()
-            print("[+] Saved all credentials to DB")
-            success = True
+            if update_payload:
+                supabase.table("audius").update(update_payload).eq("address", address).execute()
+                print("[+] Saved app_data, local_db, and profile info to DB")
+                success = True
+            else:
+                print("[!] Nothing to save")
         else:
-            print("[!] No target API captured within 30 s")
+            print("[!] No credentials or storage captured")
 
     except Exception as e:
         print("[!] Fatal:", e)
