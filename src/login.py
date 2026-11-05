@@ -509,43 +509,27 @@ async def run_one(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
             print("[!] Unexpected URL:", page.url)
             return False, address
 
-        # --- Extract Handle from Feed page ---
-        print("[*] Extracting handle from feed page ...")
-        try:
-            handle_locator = page.locator('a[data-discover="true"]').filter(has_text="@").first
-            await handle_locator.wait_for(state="visible", timeout=20_000)
-            text = await handle_locator.inner_text()
-            captured["handle"] = text.replace("@", "").strip()
-            print(f"[*] Extracted handle: {captured['handle']}")
-        except Exception as e:
-            print(f"[!] Could not extract handle after 20s: {e}")
-
         # --- Developer App Creation & Credentials (via Network) ---
         app_data = await create_app_and_extract_credentials(page, captured)
+
+        # --- Validate Credentials ---
+        if not (app_data.get("api_key") and app_data.get("api_secret") and app_data.get("bearer_token")):
+            print("[!] Missing one or more app credentials (api_key, api_secret, bearer_token).")
+            print("[!] Skipping database update and releasing account.")
+            return False, address
 
         # --- Local Storage Extraction ---
         local_db = await extract_local_storage(page)
 
         # --- Save to DB ---
-        if app_data or local_db:
-            update_payload = {}
+        update_payload = {
+            "app_data": app_data,
+            "local_db": local_db
+        }
 
-            if app_data:
-                update_payload["app_data"] = app_data
-                print("[+] App credentials ready to save")
-            if local_db:
-                update_payload["local_db"] = local_db
-            if "handle" in captured:
-                update_payload["handle"] = captured["handle"]
-
-            if update_payload:
-                supabase.table("audius").update(update_payload).eq("address", address).execute()
-                print("[+] Saved app_data, local_db, and profile info to DB")
-                success = True
-            else:
-                print("[!] Nothing to save")
-        else:
-            print("[!] No credentials or storage captured")
+        supabase.table("audius").update(update_payload).eq("address", address).execute()
+        print("[+] Saved app_data and local_db to DB")
+        success = True
 
     except Exception as e:
         print("[!] Fatal:", e)
