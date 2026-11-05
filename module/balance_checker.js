@@ -48,24 +48,35 @@ process.on('uncaughtException', (err) => {
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DB_FILE = path.join(ROOT_DIR, 'db.txt');
-const MAX_CONCURRENCY = 10;
+const MAX_RETRIES = 5;           // retries per API call on 429 / 5xx / network errors
+const BASE_DELAY_MS = 1000;      // backoff: 1s, 2s, 4s, 8s, 16s (+ jitter)
 
-// --- Concurrency Limiter ---
-async function asyncPool(poolLimit, array, iteratorFn) {
-  const ret = [];
-  const executing = [];
-  for (const item of array) {
-    const p = Promise.resolve().then(() => iteratorFn(item));
-    ret.push(p);
-    if (poolLimit <= array.length) {
-      const e = p.then(() => executing.splice(executing.indexOf(e), 1));
-      executing.push(e);
-      if (executing.length >= poolLimit) {
-        await Promise.race(executing);
-      }
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// The SDK's message ("Response returned an error code") hides the HTTP status.
+function getStatus(e) {
+  return e?.status ?? e?.response?.status ?? e?.cause?.status ?? null;
+}
+
+// Retry an SDK call on rate limits (429), server errors (5xx) and network
+// failures. Honors a Retry-After header if the error exposes one. Other
+// errors (e.g. 404) are thrown immediately.
+async function withRetry(fn) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const status = getStatus(e);
+      const retryable = status === 429 || (status !== null && status >= 500) || status === null;
+      if (!retryable || attempt >= MAX_RETRIES) throw e;
+
+      const retryAfter = parseInt(e?.response?.headers?.get?.('retry-after'), 10);
+      const delay = Number.isFinite(retryAfter)
+        ? retryAfter * 1000
+        : BASE_DELAY_MS * Math.pow(2, attempt) + Math.floor(Math.random() * 500);
+      await sleep(delay);
     }
   }
-  return Promise.all(ret);
 }
 
 // --- Check Single Account ---
@@ -100,7 +111,7 @@ async function checkAccount(supabase, account) {
 
     // 1. Fetch Profile
     try {
-      const userRes = await sdk.users.getUser({ id: userId });
+      const userRes = await withRetry(() => sdk.users.getUser({ id: userId }));
       const user = userRes?.data;
       if (user) {
         totalAudioBalance = user.totalAudioBalance ?? null;
@@ -109,12 +120,12 @@ async function checkAccount(supabase, account) {
         waudioBalance = user.waudioBalance ?? null;
       }
     } catch (e) {
-      log(`[${address}] Profile fetch failed: ${e.message || e}`);
+      log(`[${address}] Profile fetch failed (status=${getStatus(e) ?? 'unknown'}): ${e.message || e}`);
     }
 
     // 2. Fetch Coins (filter strictly for $AUDIO, sum across all accounts)
     try {
-      const coinsRes = await sdk.users.getUserCoins({ id: userId });
+      const coinsRes = await withRetry(() => sdk.users.getUserCoins({ id: userId }));
       const coins = coinsRes?.data;
       if (Array.isArray(coins)) {
         const audioCoin = coins.find(c => c.ticker === '$AUDIO');
@@ -135,20 +146,18 @@ async function checkAccount(supabase, account) {
         }
       }
     } catch (e) {
-      log(`[${address}] Coin fetch failed: ${e.message || e}`);
+      log(`[${address}] Coin fetch failed (status=${getStatus(e) ?? 'unknown'}): ${e.message || e}`);
     }
 
     // 3. Fetch Balance History
     try {
-      const historyRes = await sdk.users.getUserBalanceHistory({ id: userId, granularity: 'daily' });
+      const historyRes = await withRetry(() => sdk.users.getUserBalanceHistory({ id: userId, granularity: 'daily' }));
       const data = historyRes?.data;
       if (Array.isArray(data)) {
         historyCount = data.length;
       }
     } catch (e) {
-      // The SDK's generic error message hides the real HTTP status, so pull
-      // it out of whatever shape the error actually has.
-      const status = e?.status ?? e?.response?.status ?? e?.cause?.status ?? null;
+      const status = getStatus(e);
 
       if (status === 404) {
         // No history exists for this user (common for empty/never-funded
@@ -240,9 +249,11 @@ async function main() {
     return;
   }
 
-  log(`[*] Checking ${accounts.length} accounts with concurrency=${MAX_CONCURRENCY}...`);
+  log(`[*] Checking ${accounts.length} accounts one at a time...`);
 
-  await asyncPool(MAX_CONCURRENCY, accounts, (acc) => checkAccount(supabase, acc));
+  for (const acc of accounts) {
+    await checkAccount(supabase, acc);
+  }
 
   log(`[*] Balance check complete.`);
 }
