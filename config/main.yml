@@ -1,3 +1,4 @@
+
 name: audius
 
 on:
@@ -21,40 +22,81 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Node.js setup
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
+          registry-url: "https://registry.npmjs.org"
 
+      # Install Audius and Supabase
       - name: Install Node.js dependencies
         run: |
-          npm install @audius/sdk @supabase/supabase-js
+          npm cache clean --force
 
+          npm install --no-save --prefer-online \
+            @audius/sdk@latest \
+            @supabase/supabase-js@latest
+
+      # Verify Node.js dependencies
+      - name: Verify Node.js dependencies
+        run: |
+          node --version
+          npm --version
+
+          npm ls @audius/sdk @supabase/supabase-js
+
+      # Check for unavailable Injective dependency
+      - name: Check Injective dependency
+        continue-on-error: true
+        run: |
+          npm ls @injectivelabs/utils || true
+
+          npm view @injectivelabs/utils versions --json
+
+      # Python setup
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      # Install Python dependencies
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Chromium + its OS libraries
+      # Chromium + OS libraries
       - name: Install Playwright Chromium (with OS deps)
         run: |
           python -m playwright install --with-deps chromium
 
-      # Xvfb — required because login.py launches headless=False
+      # Xvfb
       - name: Install Xvfb
         run: |
           sudo apt-get update
           sudo apt-get install -y xvfb
 
+      # Run login.py
       - name: Run login.py under Xvfb
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-          timeout 355m xvfb-run -a --server-args="-screen 0 1280x720x24" \
+          timeout 355m xvfb-run -a \
+            --server-args="-screen 0 1280x720x24" \
             python3 -u src/login.py || true
+            
+      - name: Trigger the next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GH_REPOSITORY}/dispatches" \
+            -d '{"event_type":"run-sporty"}'
