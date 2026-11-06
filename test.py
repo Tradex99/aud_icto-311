@@ -1,93 +1,105 @@
 #!/usr/bin/env python3
+"""Find the Audius user_id for a row in the `audius` table.
+
+Audius has no email -> user_id lookup (emails are private). But each row
+already has an API key, and GET /v1/developer_apps/{api_key} returns the
+user_id of the account that owns that key.
+
+Usage:
+    python3 test.py                      # uses DEFAULT_EMAIL below
+    python3 test.py someone@example.com  # look up a different email
+    python3 test.py --save               # also write user_id back to the row
 """
-seed_audius.py — load tempmail_accounts.json into public.audius
-Uses the Supabase REST client (reads SUPABASE_URL / SUPABASE_KEY from db.txt).
-Safe to re-run — existing addresses are skipped.
-"""
-import argparse
-import json
 import re
 import sys
 from pathlib import Path
 
-from supabase import create_client
+import requests
 
-HERE = Path(__file__).resolve().parent
-DB_FILE = HERE / "db.txt"
-
-
-def load_supabase_creds() -> tuple[str, str]:
-    if not DB_FILE.exists():
-        sys.exit(f"❌ {DB_FILE} not found")
-    text = DB_FILE.read_text()
-    m_url = re.search(r'SUPABASE_URL\s*=\s*["\']([^"\']+)["\']', text)
-    m_key = re.search(r'SUPABASE_KEY\s*=\s*["\']([^"\']+)["\']', text)
-    if not m_url or not m_key:
-        sys.exit("❌ db.txt must contain SUPABASE_URL and SUPABASE_KEY")
-    return m_url.group(1), m_key.group(1)
+DEFAULT_EMAIL = "obieze3905@gmail.com"
+EMAIL_COLUMN = "address"  # column in the table that holds the email
+TABLE = "audius"
+AUDIUS_API = "https://api.audius.co/v1"
+TIMEOUT = 20
 
 
-def load_accounts(path: Path) -> list[dict]:
-    if not path.exists():
-        sys.exit(f"❌ {path} not found")
-    raw = json.loads(path.read_text())
-    values = raw.values() if isinstance(raw, dict) else raw
-
-    rows, seen = [], set()
-    for a in values:
-        addr = (a.get("address") or "").strip()
-        pwd  = (a.get("password") or "").strip()
-        reg  = (a.get("register") or "yes").strip()
-        if not addr or not pwd or addr in seen:
-            continue
-        seen.add(addr)
-        rows.append({"address": addr, "password": pwd, "register": reg})
-    return rows
+def load_supabase_creds():
+    here = Path(__file__).resolve().parent
+    for folder in (here, here.parent):
+        db_file = folder / "db.txt"
+        if db_file.exists():
+            text = db_file.read_text()
+            url = re.search(r'SUPABASE_URL\s*=\s*["\']([^"\']+)["\']', text)
+            key = re.search(r'SUPABASE_KEY\s*=\s*["\']([^"\']+)["\']', text)
+            if url and key:
+                return url.group(1).rstrip("/"), key.group(1)
+    sys.exit("[!] Could not find SUPABASE_URL / SUPABASE_KEY in db.txt")
 
 
-def chunked(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i + n]
+def main():
+    save = "--save" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    email = args[0] if args else DEFAULT_EMAIL
 
+    supa_url, supa_key = load_supabase_creds()
+    supa_headers = {"apikey": supa_key, "Authorization": f"Bearer {supa_key}"}
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--file", default=str(HERE / "tempmail_accounts.json"))
-    ap.add_argument("--batch", type=int, default=500)
-    args = ap.parse_args()
-
-    rows = load_accounts(Path(args.file))
-    if not rows:
-        sys.exit("❌ No valid accounts found")
-
-    print(f"📦 Loaded {len(rows)} unique accounts from {args.file}")
-
-    url, key = load_supabase_creds()
-    print(f"🔌 Connecting to Supabase: {url}")
-    supabase = create_client(url, key)
-
-    inserted = 0
-    for i, batch in enumerate(chunked(rows, args.batch), 1):
-        # ignore_duplicates=True  →  ON CONFLICT (address) DO NOTHING
-        resp = (
-            supabase.table("audius")
-            .upsert(batch, on_conflict="address", ignore_duplicates=True)
-            .execute()
-        )
-        n = len(resp.data or [])
-        inserted += n
-        print(f"   batch {i}: sent {len(batch):>3} rows → {n} actually inserted")
-
-    # Final count
-    count = (
-        supabase.table("audius")
-        .select("address", count="exact")
-        .limit(1)
-        .execute()
-        .count
+    # 1. Get the row (and its credentials) from the table
+    r = requests.get(
+        f"{supa_url}/rest/v1/{TABLE}",
+        headers=supa_headers,
+        params={EMAIL_COLUMN: f"eq.{email}", "select": f"{EMAIL_COLUMN},user_id,app_data"},
+        timeout=TIMEOUT,
     )
-    print(f"✅ Done. Inserted {inserted} new rows.")
-    print(f"📊 Table now contains {count} rows total.")
+    r.raise_for_status()
+    rows = r.json()
+    if not rows:
+        sys.exit(f"[!] No row found where {EMAIL_COLUMN} = {email}")
+
+    row = rows[0]
+    app_data = row.get("app_data") or {}
+    api_key = app_data.get("api_key")
+    if not api_key:
+        sys.exit("[!] Row has no app_data.api_key")
+
+    print(f"[*] Row found: {row[EMAIL_COLUMN]}")
+    print(f"[*] user_id currently in table: {row.get('user_id')}")
+
+    # 2. Ask Audius which account owns this API key
+    bearer = app_data.get("bearer_token")
+    r = requests.get(
+        f"{AUDIUS_API}/developer_apps/{api_key}",
+        headers={"Authorization": f"Bearer {bearer}"} if bearer else {},
+        timeout=TIMEOUT,
+    )
+    if r.status_code in (401, 403) and bearer:  # bad/expired token: retry anonymously
+        r = requests.get(f"{AUDIUS_API}/developer_apps/{api_key}", timeout=TIMEOUT)
+    if r.status_code == 404:
+        sys.exit("[!] Audius has no developer app registered for this API key")
+    r.raise_for_status()
+
+    app = r.json()["data"]
+    user_id = app["user_id"]
+    print(f"[+] Developer app: {app.get('name')}")
+    print(f"[+] Owner user_id: {user_id}")
+
+    # 3. Sanity check: show who that user is
+    r = requests.get(f"{AUDIUS_API}/users/{user_id}", timeout=TIMEOUT)
+    if r.ok:
+        user = r.json().get("data") or {}
+        print(f"[+] Profile: @{user.get('handle')} ({user.get('name')})")
+
+    # 4. Optionally save it
+    if save:
+        r = requests.patch(
+            f"{supa_url}/rest/v1/{TABLE}",
+            headers={**supa_headers, "Content-Type": "application/json", "Prefer": "return=minimal"},
+            params={EMAIL_COLUMN: f"eq.{email}"},
+            json={"user_id": user_id},
+            timeout=TIMEOUT,
+        )
+        r.raise_for_status()
+        print("[+] Saved user_id to the table")
 
 
 if __name__ == "__main__":
