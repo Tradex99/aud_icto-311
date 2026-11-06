@@ -103,20 +103,33 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // Short, readable error text (includes the HTTP status when the API gave one).
 async function describeError(err) {
-  let msg = String((err && err.message) || err).replace(/\s+/g, ' ');
   const res = err && err.response;
+  const step = err && err.step ? `${err.step}: ` : '';
   if (res && res.status) {
-    let detail = '';
+    let body = '';
     try {
-      detail = (await res.clone().text()).replace(/\s+/g, ' ').slice(0, 80);
+      body = await res.clone().text();
     } catch (_) {}
-    msg = `HTTP ${res.status}${detail ? ` ${detail}` : ''}`;
+    if (res.status === 401 || res.status === 403) {
+      const w = (body.match(/authedWallet=(0x[0-9a-fA-F]+)/) || [])[1];
+      const wallet = w ? `, wallet ${w.slice(0, 6)}...${w.slice(-4)}` : '';
+      return `${step}not authorized (HTTP ${res.status}${wallet})`;
+    }
+    return `${step}HTTP ${res.status} ${body.replace(/\s+/g, ' ').slice(0, 80)}`.trim();
   }
-  return msg.slice(0, 120);
+  return (step + String((err && err.message) || err)).replace(/\s+/g, ' ').slice(0, 120);
+}
+
+// Retrying only helps for temporary problems (rate limit, server error, network).
+// Other 4xx responses (e.g. 403 not authorized) will fail the same way every time.
+function isRetryable(err) {
+  const status = err && err.response && err.response.status;
+  if (!status) return true;
+  return status === 408 || status === 429 || status >= 500;
 }
 
 // One attempt: checks the live profile first, then fills in only what's missing.
-// Throws on errors so the caller can retry; returns a status string otherwise.
+// Throws on errors so the caller can decide whether to retry; otherwise returns a status.
 async function attemptAccount(account, tag) {
   const { user_id: userId, app_data: appData } = account;
 
@@ -126,41 +139,83 @@ async function attemptAccount(account, tag) {
     bearerToken: appData.bearer_token,
   });
 
-  // 1. Request the current profile (fresh on every attempt, so a retry never
-  //    re-adds something that a previous attempt already saved)
-  const user = (await sdk.users.getUser({ id: userId })).data;
-  if (!user) {
-    log(`${tag}  failed: user not found`);
-    return 'failed';
+  // Tag errors with the step they came from, so the log says where it broke.
+  let step = 'check';
+  try {
+    // 1. Request the current profile (fresh on every attempt, so a retry never
+    //    re-adds something that a previous attempt already saved)
+    const user = (await sdk.users.getUser({ id: userId })).data;
+    if (!user) {
+      log(`${tag}  failed: user not found`);
+      return 'failed';
+    }
+
+    const missing = {
+      bio: !hasBio(user),
+      photo: !hasPhoto(user),
+      cover: !hasCover(user),
+    };
+    const have = Object.keys(missing).filter(k => !missing[k]);
+    const need = Object.keys(missing).filter(k => missing[k]);
+
+    // 2. Everything exists -> skip
+    if (need.length === 0) {
+      log(`${tag}  skipped (has bio + photo + cover)`);
+      return 'skipped';
+    }
+
+    // 3. Only generate/upload what is missing
+    step = 'upload';
+    const metadata = {};
+    if (missing.bio) metadata.bio = generateBio();
+    if (missing.photo) metadata.profilePicture = await uploadPhoto(sdk);
+    if (missing.cover) metadata.coverPhoto = await uploadCover(sdk);
+
+    step = 'update';
+    await sdk.users.updateUser({ id: userId, userId, metadata });
+
+    log(`${tag}  added ${need.join(' + ')}${have.length ? ` (already had ${have.join(' + ')})` : ''}`);
+    return 'updated';
+  } catch (err) {
+    if (err && typeof err === 'object' && !err.step) err.step = step;
+    throw err;
   }
-
-  const missing = {
-    bio: !hasBio(user),
-    photo: !hasPhoto(user),
-    cover: !hasCover(user),
-  };
-  const have = Object.keys(missing).filter(k => !missing[k]);
-  const need = Object.keys(missing).filter(k => missing[k]);
-
-  // 2. Everything exists -> skip
-  if (need.length === 0) {
-    log(`${tag}  skipped (has bio + photo + cover)`);
-    return 'skipped';
-  }
-
-  // 3. Only generate/upload what is missing
-  const metadata = {};
-  if (missing.bio) metadata.bio = generateBio();
-  if (missing.photo) metadata.profilePicture = await uploadPhoto(sdk);
-  if (missing.cover) metadata.coverPhoto = await uploadCover(sdk);
-
-  await sdk.users.updateUser({ id: userId, userId, metadata });
-
-  log(`${tag}  added ${need.join(' + ')}${have.length ? ` (already had ${have.join(' + ')})` : ''}`);
-  return 'updated';
 }
 
-// Runs an account, retrying up to MAX_RETRIES times if a request fails.
+// On a 403, work out WHY using two read-only checks (nothing is written):
+//  1. is this app (api_key) among the apps the user has authorized?
+//  2. does the bearer_token actually belong to this user?
+async function diagnose403(account) {
+  const { user_id: userId, app_data: a } = account;
+  const sdk = sdkFactory({ apiKey: a.api_key, apiSecret: a.api_secret, bearerToken: a.bearer_token });
+  const out = [];
+
+  try {
+    const res = await sdk.users.getAuthorizedApps({ id: userId });
+    const apps = res && res.data;
+    const key = String(a.api_key).toLowerCase().replace(/^0x/, '');
+    const found = JSON.stringify(apps || []).toLowerCase().includes(key);
+    const n = Array.isArray(apps) ? apps.length : '?';
+    out.push(found ? `app is authorized by user (${n} apps)` : `app NOT in user's authorized apps (${n} apps)`);
+  } catch (e) {
+    out.push(`authorized-apps check failed (HTTP ${(e && e.response && e.response.status) || '?'})`);
+  }
+
+  try {
+    const me = await sdk.users.getMe();
+    const text = JSON.stringify((me && me.data) || {});
+    out.push(text.includes(userId) ? 'token belongs to this user' : 'token belongs to a DIFFERENT user');
+  } catch (e) {
+    out.push(`token check failed (HTTP ${(e && e.response && e.response.status) || '?'})`);
+  }
+
+  return out.join('; ');
+}
+
+// Accounts that failed, listed again at the end so they're easy to find.
+const failures = [];
+
+// Runs an account, retrying only temporary errors (up to MAX_RETRIES times).
 async function processAccount(account, label) {
   const { address, user_id: userId, app_data: appData } = account;
   const tag = `${label} ${address}`;
@@ -175,8 +230,21 @@ async function processAccount(account, label) {
       return await attemptAccount(account, tag);
     } catch (err) {
       const reason = await describeError(err);
+
+      if (!isRetryable(err)) {
+        log(`${tag}  failed: ${reason}`);
+        let full = reason;
+        if (err.response && err.response.status === 403) {
+          const why = await diagnose403(account).catch(e => `diagnosis failed: ${e.message || e}`);
+          log(`      -> ${why}`);
+          full = `${reason} -> ${why}`;
+        }
+        failures.push(`${address}  ${full}`);
+        return 'failed';
+      }
       if (attempt >= MAX_RETRIES) {
         log(`${tag}  failed after ${MAX_RETRIES} retries: ${reason}`);
+        failures.push(`${address}  ${reason}`);
         return 'failed';
       }
       log(`${tag}  retry ${attempt + 1}/${MAX_RETRIES} (${reason})`);
@@ -224,6 +292,9 @@ async function main() {
     counts.nocreds && `${counts.nocreds} missing credentials`,
   ].filter(Boolean);
   log(`\nDone: ${parts.join(', ')}`);
+  if (failures.length) {
+    log(`\nFailed accounts:\n${failures.map(f => `  ${f}`).join('\n')}`);
+  }
 }
 
 main().catch(err => {
