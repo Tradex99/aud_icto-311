@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-const DAILY_REPOSTS_PER_TRACK = 16;
-const WEEKLY_REPOSTS_PER_TRACK = 80;
+const DAILY_REPOSTS_PER_TRACK = 21;
+const WEEKLY_REPOSTS_PER_TRACK = 150;
 const RUNS_PER_DAY = 2;
 
 const fs = require('fs');
