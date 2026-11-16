@@ -682,7 +682,7 @@ async function runBatch(tasks, concurrency) {
 
 // Interact with a track using accounts from the pool until target reached
 // or the pool is exhausted. On 429, account is marked in cooldown and we
-// continue with the next available account.
+// continue silently with the next available account.
 async function interactTrackKind(state, trackId, kind, pool, targetCount) {
   const entry = state.fed_tracks[trackId];
   if (!entry) return { done: false, reason: 'no-entry' };
@@ -724,7 +724,6 @@ async function interactTrackKind(state, trackId, kind, pool, targetCount) {
     await runBatch(tasks, CFG.concurrency);
 
     if (batchRateLimits > 0) {
-      log(`[!] ${batchRateLimits} rate limit(s) during ${kind} for ${trackId}; ${entry[kind].length}/${targetCount} done. Swapping accounts.`);
       await sleep(CFG.rateWaitMs);
     }
   }
@@ -834,9 +833,12 @@ async function doFeedInteract(sb, ctx, state, pool, primary) {
     await saveState(sb, ctx, state);
     if (!repResult.done && repResult.reason === 'lock-lost') break;
 
-    const favTag = favResult.done ? '' : ` (${favResult.reason})`;
-    const repTag = repResult.done ? '' : ` (${repResult.reason})`;
-    log(`[*] Track ${t.id}${t.title ? ` "${t.title.slice(0, 40)}"` : ''} | fav ${entry.favorited_by.length}/${TARGET_INTERACTIONS}${favTag}, repost ${entry.reposted_by.length}/${TARGET_INTERACTIONS}${repTag}`);
+    const tags = [];
+    if (!favResult.done) tags.push(`fav:${favResult.reason}`);
+    if (!repResult.done) tags.push(`rep:${repResult.reason}`);
+    const suffix = tags.length ? ` (${tags.join(', ')})` : '';
+    const titlePart = t.title ? ` "${t.title.slice(0, 40)}"` : '';
+    log(`[*] Track ${t.id}${titlePart} | FAV ${entry.favorited_by.length}/${TARGET_INTERACTIONS} | REP ${entry.reposted_by.length}/${TARGET_INTERACTIONS}${suffix}`);
 
     if (CFG.actionDelayMs) await sleep(CFG.actionDelayMs);
   }
