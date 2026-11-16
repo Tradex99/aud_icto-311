@@ -2,7 +2,7 @@
 'use strict';
 
 const DAILY_REPOSTS_PER_TRACK = 100;
-const WEEKLY_REPOSTS_PER_TRACK = 300;
+const WEEKLY_REPOSTS_PER_TRACK = 400;
 const RUNS_PER_DAY = 2;
 
 const fs = require('fs');
