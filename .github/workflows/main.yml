@@ -66,7 +66,7 @@ jobs:
           python --version
 
       # Run Audius automation
-      - name: Run login.py
+      - name: Run main.py
         timeout-minutes: 340
         env:
           PYTHONUNBUFFERED: "1"
@@ -84,7 +84,7 @@ jobs:
 =======
           timeout 355m xvfb-run -a \
             --server-args="-screen 0 1280x720x24" \
-            python3 -u main.py com_profile.js || true
+            python3 -u main.py tastemaker.js || true
 
 >>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       - name: Trigger the next run
