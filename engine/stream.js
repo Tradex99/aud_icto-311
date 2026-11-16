@@ -11,7 +11,6 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createClient } = require('@supabase/supabase-js');
 
 const asyncLocalStorage = new AsyncLocalStorage();
-const realFetch = globalThis.fetch; // Save native fetch for bypassing proxy
 
 const DEFAULT_PROXIES = [
   'https://audius-v2.qringgreen.workers.dev',
@@ -27,6 +26,7 @@ const PROXY_URLS = [...new Set(
 )];
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 {
+  const realFetch = globalThis.fetch;
   const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
   const RETRY_STATUS = new Set([502, 503, 504]);
   const downUntil = new Map();
@@ -34,7 +34,7 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
   const ATTEMPTS = Number(process.env.PROXY_ATTEMPTS || 6);
   const STATUS_ATTEMPTS = Number(process.env.PROXY_STATUS_ATTEMPTS || 3);
   const sleepMs = ms => new Promise(r => setTimeout(r, ms));
-  
+
   const pick = avoid => {
     const now = Date.now();
     const up = PROXY_URLS.filter(u => (downUntil.get(u) || 0) <= now);
@@ -49,20 +49,20 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
-    
+
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
     if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
     let lastErr;
     let lastProxy = null;
     let statusTries = 0;
-    
+
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
       const assigned = asyncLocalStorage.getStore()?.proxy;
       const isAssignedHealthy = assigned && (downUntil.get(assigned) || 0) <= Date.now();
-      
+
       const proxy = (isAssignedHealthy && assigned !== lastProxy) ? assigned : pick(lastProxy);
       lastProxy = proxy;
-      
+
       const target = proxy + url.pathname + url.search;
       let res;
       try {
@@ -81,7 +81,7 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
       if (RETRY_STATUS.has(res.status) && ++statusTries < STATUS_ATTEMPTS) {
         try { if (res.body) await res.body.cancel(); } catch (_) {}
         await sleepMs(500 * statusTries);
-        continue; 
+        continue;
       }
       return res;
     }
@@ -151,6 +151,13 @@ const CFG = {
   workerCount: 10,
   workerStaggerMs: Number(process.env.WORKER_STAGGER_MS || 5000),
   workerJitterMs: Number(process.env.WORKER_JITTER_MS || 2000),
+  // trending tuning
+  trendingLimit: Number(process.env.TRENDING_LIMIT || 100),
+  trendingTopMin: Number(process.env.TRENDING_TOP_MIN || 10),
+  trendingTopMax: Number(process.env.TRENDING_TOP_MAX || 20),
+  targetRangeMin: Number(process.env.TARGET_RANGE_MIN || 23),
+  targetRangeMax: Number(process.env.TARGET_RANGE_MAX || 27),
+  previousWeekPerRun: Number(process.env.PREVIOUS_WEEK_STREAMS_PER_RUN || 100),
 };
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -535,7 +542,7 @@ async function playStream(streamUrl, playMs, durationSec) {
     } finally {
       clearTimeout(connectTimer);
     }
-    
+
     if (!res.ok) {
       let detail = '';
       try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
@@ -607,7 +614,7 @@ async function streamJob(sb, ctx, run, acct, target, workerId) {
       stage = 'play';
       return playStream(meta.streamUrl, playMs, meta.duration);
     }, e => {
-      if (e && e.interrupted) return false; 
+      if (e && e.interrupted) return false;
       const code = statusOf(e);
       if (code >= 500 || code === 408) { run.meta.delete(target.key); say(`${stage}: ${reason(e)}; retrying`); return true; }
       return false;
@@ -657,16 +664,16 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
 
   const worker = async (id) => {
     const proxy = PROXY_URLS[(id - 1) % PROXY_URLS.length];
-    
+
     return asyncLocalStorage.run({ proxy }, async () => {
       const staggerDelay = (id - 1) * CFG.workerStaggerMs + Math.floor(Math.random() * CFG.workerJitterMs);
-      
+
       log(`[worker${id}] Streaming ${target.id} | target ${maxOk} (starting in ${(staggerDelay / 1000).toFixed(1)}s)`);
-      
+
       if (staggerDelay > 0) {
         await sleep(staggerDelay);
       }
-      
+
       while (!stopWorkers) {
         if (run.abort || LOCK_LOST || run.stop) break;
         if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
@@ -675,17 +682,17 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
           break;
         }
         if (got >= maxOk || started >= attempts) {
-           stopWorkers = true;
-           break;
+          stopWorkers = true;
+          break;
         }
-        
+
         let acct = candidates.shift();
         while (acct && run.cool.has(acct.address)) acct = candidates.shift();
         if (!acct) {
-           stopWorkers = true;
-           break;
+          stopWorkers = true;
+          break;
         }
-        
+
         started++;
         const outcome = await streamJob(sb, ctx, run, acct, target, `worker${id}`);
         if (outcome === 'ok') got++;
@@ -698,7 +705,7 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
     promises.push(worker(i));
   }
   await Promise.all(promises);
-  
+
   return { got, started, skipped: started - got };
 }
 
@@ -727,33 +734,33 @@ function countTracks(rows, ctx, runNumber) {
   return counts;
 }
 
-async function fetchTrendingList(sdk) {
-  try {
-    log(`[*] Fetching trending tracks via SDK...`);
-    const res = await sdk.tracks.getTrendingTracks({ time: 'week', limit: 100 });
-    const list = res && res.data ? res.data : [];
-    log(`[*] Fetched ${list.length} trending tracks.`);
-    return list;
-  } catch (e) {
-    log(`[!] Failed to fetch trending list via SDK: ${e.message}`);
-    // Fallback to direct REST API without proxy
+/**
+ * Fetch trending tracks (top N) from Audius.
+ * Retries on 429/5xx; returns [] on hard failure (safe fallback: stream all).
+ */
+async function fetchTrendingList(limit = CFG.trendingLimit) {
+  const url = `https://api.audius.co/v1/tracks/trending?time=week&limit=${limit}`;
+  let lastErr;
+  for (let i = 1; i <= 3; i++) {
     try {
-      log(`[*] Attempting direct fetch to bypass proxy...`);
-      const res = await realFetch("https://api.audius.co/v1/tracks/trending?time=week&limit=100&app_name=audius-client", {
-        headers: { Accept: 'application/json' }
-      });
+      const res = await fetch(url, { headers: { Accept: 'application/json' } });
       if (!res.ok) {
-        log(`[!] Direct fetch failed: HTTP ${res.status}`);
+        if (res.status === 429 || res.status >= 500) {
+          await sleep(1000 * i);
+          continue;
+        }
+        log(`[!] Trending fetch returned HTTP ${res.status}`);
         return [];
       }
       const data = await res.json();
-      log(`[*] Fetched ${data.data ? data.data.length : 0} trending tracks directly.`);
-      return data.data || [];
-    } catch (e2) {
-      log(`[!] Fallback fetch also failed: ${e2.message}`);
-      return [];
+      return (data && data.data) || [];
+    } catch (e) {
+      lastErr = e;
+      if (i < 3) await sleep(1000 * i);
     }
   }
+  if (lastErr) log(`[!] Failed to fetch trending list: ${lastErr.message}`);
+  return [];
 }
 
 async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
@@ -771,62 +778,95 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
 
-  // =========================================================
-  // Fetch Trending & Adjust Targets
-  // =========================================================
-  const readerSdk = makeSdk(reader);
-  const trendingTracks = await fetchTrendingList(readerSdk);
-  
+  // =========================================================================
+  // TRENDING-AWARE TARGET SELECTION
+  // =========================================================================
+  // Strategy for current-week tracks (from up_tracks):
+  //   - rank < targetRangeMin (23)         -> SKIP (above range, don't push higher)
+  //   - rank in [23, 27]                   -> SKIP (sitting in target range)
+  //   - rank > 27 or not in trending       -> STREAM (push up into range)
+  //
+  // This naturally maintains ~5 tracks in positions 23-27: tracks that
+  // enter the band are skipped, so they decay out over time; when they fall
+  // past 27 they're picked up again and pushed back in.
+  //
+  // Requirement 6A (previous-week bonus):
+  //   Any track in trending positions 10-20 owned by an account in the
+  //   audius table (but NOT one of our current up_tracks) gets 100
+  //   streams per run to push it towards top 1-9.
+  // =========================================================================
+  const trendingTracks = await fetchTrendingList();
   const rankMap = new Map();
   const ownerMap = new Map();
   const handleMap = new Map();
-  
+
   accounts.forEach(a => {
     if (a.user_id) ownerMap.set(String(a.user_id), a);
     if (a.handle) handleMap.set(a.handle.toLowerCase(), a);
   });
 
-  const previousTargets = [];
+  trendingTracks.forEach((t, i) => rankMap.set(t.id, i + 1));
 
-  trendingTracks.forEach((t, i) => {
-    const rank = i + 1;
-    rankMap.set(t.id, rank);
-    
-    // Step A: Previous week tracks in 10-20
-    if (rank >= 10 && rank <= 20) {
-      const u = t.user || {};
-      const userId = u.id || t.user_id;
-      const handle = u.handle || t.handle;
-      const owner = ownerMap.get(String(userId)) || handleMap.get(String(handle).toLowerCase());
-      
-      if (owner && !targetAddrs.has(owner.address)) {
-        previousTargets.push({
-          id: t.id, key: t.id, address: owner.address, handle: owner.handle,
-          date: 'previous', cap: 1000, maxPerRun: 100
-        });
-      }
-    }
-  });
+  // --- Categorize current up_tracks by trending position ---
+  const targetTrackIds = new Set(rawTargets.map(t => t.key || t.id));
+  const belowRange = [];  // rank > 27 or not trending -> stream
+  const inRange = [];     // 23 <= rank <= 27 -> skip (target hit)
+  const aboveRange = [];  // rank < 23 -> skip (too high)
 
-  let inRange = 0;
   for (const t of rawTargets) {
     const rank = rankMap.get(t.id);
-    if (rank && rank >= 23 && rank <= 27) inRange++;
+    if (rank === undefined || rank > CFG.targetRangeMax) belowRange.push(t);
+    else if (rank >= CFG.targetRangeMin) inRange.push(t);
+    else aboveRange.push(t);
   }
-  log(`[*] Currently ${inRange} of our tracks are in the 23-27 range.`);
 
-  const filteredTargets = rawTargets.filter(t => {
-    const rank = rankMap.get(t.id) || 999;
-    if (rank < 23) return false; // Too high
-    if (rank >= 23 && rank <= 27 && inRange >= 5) return false; // We have enough in range
-    return true;
+  // --- Previous-week bonus targets (trending 10-20, our accounts, not up_tracks) ---
+  const previousTargets = [];
+  const previousSeen = new Set();
+  trendingTracks.forEach((t, i) => {
+    const rank = i + 1;
+    if (rank < CFG.trendingTopMin || rank > CFG.trendingTopMax) return;
+    if (targetTrackIds.has(t.id) || previousSeen.has(t.id)) return;
+    const u = t.user || {};
+    const owner = ownerMap.get(String(u.id)) || handleMap.get(String((u.handle || '').toLowerCase())];
+    if (!owner) return;
+    previousSeen.add(t.id);
+    previousTargets.push({
+      id: t.id, key: t.id,
+      address: owner.address, handle: owner.handle,
+      date: ctx.today, day: ctx.dayName,
+      cap: CFG.dailyPerTrack, maxPerRun: CFG.previousWeekPerRun,
+      source: 'previous', trendingRank: rank,
+    });
   });
 
-  const targets = [...filteredTargets, ...previousTargets];
-  if (previousTargets.length > 0) {
-    log(`[*] Found ${previousTargets.length} previous week track(s) in the 10-20 range.`);
+  // --- Diagnostic log: show every up_track and where it sits ---
+  if (rawTargets.length) {
+    const positions = rawTargets.map(t => {
+      const r = rankMap.get(t.id);
+      return `${String(t.id).slice(0, 8)}:${r === undefined ? 'n/a' : `#${r}`}`;
+    }).join(' ');
+    log(`[*] Up_tracks positions: ${positions}`);
   }
-  // =========================================================
+  log(`[*] Trending: ${inRange.length} in [${CFG.targetRangeMin}-${CFG.targetRangeMax}] (skip), ` +
+      `${aboveRange.length} above ${CFG.targetRangeMin} (skip), ` +
+      `${belowRange.length} below ${CFG.targetRangeMax}/not trending (stream)` +
+      `${previousTargets.length ? `, ${previousTargets.length} previous-week [${CFG.trendingTopMin}-${CFG.trendingTopMax}] bonus` : ''}`);
+
+  const targets = [...belowRange, ...previousTargets];
+  // =========================================================================
+
+  if (!targets.length) {
+    log(`[*] All ${rawTargets.length} up_tracks at trending 1-${CFG.targetRangeMax} (above or in target range). Nothing to stream.`);
+    await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+      if (!h.batches) h.batches = [];
+      const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
+      if (b && b.done) return false;
+      if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
+      return true;
+    });
+    return { status: 'COMPLETED' };
+  }
 
   const need = new Map(targets.map(t => {
     const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
@@ -882,17 +922,19 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
     const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !run.cool.has(a.address));
     const order = shuffle(pool).sort((x, y) => x.today - y.today);
     const candidates = order.length ? Array.from({ length: n.attempts }, (_, i) => order[i % order.length]) : [];
-    
+
+    const wasVerbose = VERBOSE;
     VERBOSE = true;
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
-    VERBOSE = false;
-    
+    VERBOSE = wasVerbose;
+
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
+    const tag = t.source === 'previous' ? ` (bonus, was #${t.trendingRank})` : '';
     if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
+      log(`[!] track ${t.id}${tag} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
     } else {
-      log(`[*] track ${t.id} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id}${tag} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
     if (run.stop) incomplete = true;
   }
