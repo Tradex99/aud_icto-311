@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 
-const DAILY_FAVORITES_PER_TRACK = 42;
-const WEEKLY_FAVORITES_PER_TRACK = 300;
+const DAILY_FAVORITES_PER_TRACK = 100;
+const WEEKLY_FAVORITES_PER_TRACK = 350;
 const RUNS_PER_DAY = 2;
 
 const fs = require('fs');
