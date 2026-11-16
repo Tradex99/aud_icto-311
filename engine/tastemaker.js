@@ -3,11 +3,13 @@
 
 // ============ CONSTANTS ============
 const DEFAULT_TRENDING_HOURS = 5;
-const DEFAULT_HELPER_COUNT = 19;
+const DEFAULT_HELPER_COUNT = 50;
 const DEFAULT_TRENDING_MIN = 1;
 const DEFAULT_TRENDING_MAX = 20;
 const DEFAULT_FEED_LIMIT = 30;
 const DEFAULT_MAX_TRACKS_PER_RUN = 5;
+const DEFAULT_FIRST_RUN_TRACKS = 10;
+const TARGET_INTERACTIONS = 20;             // total accounts per track per action (favorite / repost)
 const FEED_TRACK_MAX_AGE_MS = 24 * 3600 * 1000;
 const STATE_VERSION_MAX_TRACKS = 1000;
 
@@ -103,6 +105,7 @@ const log = console.log.bind(console);
 const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
 const FORCE_TRENDING = process.argv.includes('--force-trending');
 const FORCE_FEED = process.argv.includes('--force-feed');
+const FORCE_FIRST_RUN = process.argv.includes('--force-first-run');
 let lastBgLog = 0;
 process.on('unhandledRejection', e => {
   if (Date.now() - lastBgLog < 30000) return;
@@ -136,11 +139,12 @@ const CFG = {
   helperCount: Number(process.env.HELPER_COUNT || DEFAULT_HELPER_COUNT),
   feedLimit: Number(process.env.FEED_LIMIT || DEFAULT_FEED_LIMIT),
   maxTracksPerRun: Number(process.env.MAX_TRACKS_PER_RUN || DEFAULT_MAX_TRACKS_PER_RUN),
+  firstRunTracks: Number(process.env.FIRST_RUN_TRACKS || DEFAULT_FIRST_RUN_TRACKS),
+  rateLimitCooldownMs: Number(process.env.RATE_LIMIT_COOLDOWN_MINUTES || 3) * 60000,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
   retryBaseMs: Number(process.env.RETRY_BASE_MS || 2000),
-  verifyTries: Number(process.env.VERIFY_TRIES || 1),
   verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 300),
   failStopAfter: Number(process.env.FAIL_STOP_AFTER || 15),
   actionDelayMs: Number(process.env.ACTION_DELAY_MS || 50),
@@ -150,7 +154,6 @@ const CFG = {
   feedTimeoutMs: Number(process.env.FEED_TIMEOUT_SECONDS || 15) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
   rateWaitMs: Number(process.env.RATE_WAIT_MS || 3000),
-  rateWaitMax: Number(process.env.RATE_WAIT_MAX_MS || 15000),
   loopIntervalMs: Number(process.env.LOOP_INTERVAL_SECONDS || 30) * 1000,
   feedBackoffBaseMs: Number(process.env.FEED_BACKOFF_BASE_MS || 10000),
   feedBackoffMaxMs: Number(process.env.FEED_BACKOFF_MAX_MS || 60000),
@@ -277,7 +280,7 @@ async function fetchPrimary(sb) {
 async function fetchHelperPool(sb, primaryAddress) {
   const out = [];
   const page = 200;
-  for (let from = 0; from < 5 * page; from += page) {
+  for (let from = 0; from < 10 * page; from += page) {
     const data = await withRetry(async () => {
       const { data, error } = await sb.from('audius')
         .select('address, handle, user_id, app_data')
@@ -298,8 +301,7 @@ async function fetchHelperPool(sb, primaryAddress) {
 // ============ STATE ============
 function sameWeek(raw, weekStart) {
   if (!isObj(raw)) return false;
-  if (raw.week_start === weekStart) return true;
-  return false;
+  return raw.week_start === weekStart;
 }
 
 function normalizeTmaker(raw, weekStart) {
@@ -308,19 +310,29 @@ function normalizeTmaker(raw, weekStart) {
     h.week_start = weekStart;
     if (!isObj(h.followed)) h.followed = {};
     if (!isObj(h.fed_tracks)) h.fed_tracks = {};
-    if (!Array.isArray(h.helpers)) h.helpers = [];
+    if (!isObj(h.cooldowns)) h.cooldowns = {};
+    if (typeof h.first_run_done !== 'boolean') h.first_run_done = false;
     return h;
   }
   const h = {
     week_start: weekStart,
-    helpers: [],
     followed: {},
     fed_tracks: {},
+    cooldowns: {},
+    first_run_done: false,
     last_trend_check: null,
     feed_fail_count: 0,
     feed_retry_at: null,
   };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
+  // Preserve unexpired rate-limit cooldowns across week reset
+  if (isObj(raw) && isObj(raw.cooldowns)) {
+    const now = Date.now();
+    for (const [addr, exp] of Object.entries(raw.cooldowns)) {
+      const t = Date.parse(exp);
+      if (Number.isFinite(t) && t > now) h.cooldowns[addr] = exp;
+    }
+  }
   return h;
 }
 
@@ -428,9 +440,25 @@ async function saveState(sb, ctx, state) {
   });
 }
 
+// ============ COOLDOWNS ============
+function pruneCooldowns(state) {
+  const now = Date.now();
+  for (const [addr, exp] of Object.entries(state.cooldowns)) {
+    if (Date.parse(exp) <= now) delete state.cooldowns[addr];
+  }
+}
+
+function isOnCooldown(state, address) {
+  const exp = state.cooldowns[address];
+  if (!exp) return false;
+  return Date.parse(exp) > Date.now();
+}
+
+function markCooldown(state, address, ms = CFG.rateLimitCooldownMs) {
+  state.cooldowns[address] = new Date(Date.now() + ms).toISOString();
+}
+
 // ============ PROXIED FETCH ============
-// All Audius API calls bypass the SDK for reads. The SDK's discovery-node
-// resolution hits non-proxied hosts, which is what caused the 20s timeouts.
 async function audiusGet(pathname, what, timeoutMs = CFG.callTimeoutMs) {
   const url = `https://api.audius.co${pathname}`;
   let lastErr;
@@ -621,11 +649,12 @@ function pruneFedTracks(state) {
 
 async function interactTask(state, trackId, kind, acct) {
   const entry = state.fed_tracks[trackId];
+  if (!entry) return { status: 'skip' };
   const list = entry[kind];
   if (list.includes(acct.address)) return { status: 'skip' };
-  let sdk = acct._sdk;
-  if (!sdk) { sdk = makeSdk(acct); acct._sdk = sdk; }
   try {
+    let sdk = acct._sdk;
+    if (!sdk) { sdk = makeSdk(acct); acct._sdk = sdk; }
     if (kind === 'favorited_by') {
       await withTimeout(sdk.tracks.favoriteTrack({ userId: acct.user_id, trackId }), CFG.callTimeoutMs, 'favoriteTrack');
     } else {
@@ -636,6 +665,7 @@ async function interactTask(state, trackId, kind, acct) {
   } catch (e) {
     if (isRateLimit(e)) return { status: 'rate', error: e };
     if (classify(e) === 'permanent') {
+      // Treat 4xx as done (already favorited/reposted, invalid, etc.) to avoid infinite retries
       list.push(acct.address);
       return { status: 'perm', error: e };
     }
@@ -643,25 +673,63 @@ async function interactTask(state, trackId, kind, acct) {
   }
 }
 
-async function runConcurrent(tasks, concurrency, onRateLimit) {
-  let idx = 0;
-  let stop = false;
-  const workers = [];
-  for (let i = 0; i < concurrency; i++) {
-    workers.push((async () => {
-      while (!stop && idx < tasks.length) {
-        const task = tasks[idx++];
-        if (!task) break;
-        const result = await task();
-        if (result && result.status === 'rate') {
-          stop = true;
-          if (onRateLimit) onRateLimit(result.error);
-        }
-      }
-    })());
+async function runBatch(tasks, concurrency) {
+  for (let i = 0; i < tasks.length; i += concurrency) {
+    const chunk = tasks.slice(i, i + concurrency).map(fn => fn());
+    await Promise.all(chunk);
   }
-  await Promise.all(workers);
-  return stop;
+}
+
+// Interact with a track using accounts from the pool until target reached
+// or the pool is exhausted. On 429, account is marked in cooldown and we
+// continue with the next available account.
+async function interactTrackKind(state, trackId, kind, pool, targetCount) {
+  const entry = state.fed_tracks[trackId];
+  if (!entry) return { done: false, reason: 'no-entry' };
+  const triedForThisTrack = new Set();
+  let batchCount = 0;
+  const MAX_BATCHES = 30; // safety cap: 30 batches × 12 = 360 account attempts max
+
+  while (entry[kind].length < targetCount) {
+    if (LOCK_LOST) return { done: false, reason: 'lock-lost' };
+    if (++batchCount > MAX_BATCHES) return { done: false, reason: 'batch-cap', partial: entry[kind].length };
+
+    pruneCooldowns(state);
+
+    const doneSet = new Set(entry[kind]);
+    const available = pool.filter(a =>
+      !doneSet.has(a.address) &&
+      !triedForThisTrack.has(a.address) &&
+      !isOnCooldown(state, a.address)
+    );
+
+    if (!available.length) {
+      return { done: false, reason: 'pool-exhausted', partial: entry[kind].length };
+    }
+
+    const need = targetCount - entry[kind].length;
+    const batch = available.slice(0, Math.min(need, CFG.concurrency));
+
+    let batchRateLimits = 0;
+    const tasks = batch.map(acct => async () => {
+      triedForThisTrack.add(acct.address);
+      const result = await interactTask(state, trackId, kind, acct);
+      if (result.status === 'rate') {
+        markCooldown(state, acct.address);
+        batchRateLimits++;
+        if (VERBOSE) log(`[!] ${acct.address.slice(0, 8)}… rate-limited on ${kind} for ${trackId}; cooldown ${Math.round(CFG.rateLimitCooldownMs / 60000)}min.`);
+      }
+    });
+
+    await runBatch(tasks, CFG.concurrency);
+
+    if (batchRateLimits > 0) {
+      log(`[!] ${batchRateLimits} rate limit(s) during ${kind} for ${trackId}; ${entry[kind].length}/${targetCount} done. Swapping accounts.`);
+      await sleep(CFG.rateWaitMs);
+    }
+  }
+
+  return { done: true, partial: entry[kind].length };
 }
 
 function shouldSkipFeed(state) {
@@ -687,7 +755,7 @@ function recordFeedSuccess(state) {
   state.feed_retry_at = null;
 }
 
-async function doFeedInteract(sb, ctx, state, workingSet, primary) {
+async function doFeedInteract(sb, ctx, state, pool, primary) {
   let feedItems;
   try {
     feedItems = await fetchFeed(primary.user_id, CFG.feedLimit);
@@ -706,23 +774,50 @@ async function doFeedInteract(sb, ctx, state, workingSet, primary) {
     return;
   }
 
-  const newTracks = [];
+  // Build candidate list: new tracks or partially-interacted tracks
+  let newTracks = [];
   for (const t of tracks) {
     const entry = state.fed_tracks[t.id];
     if (!entry) { newTracks.push(t); continue; }
+    if (entry.skipped) continue;
     const favs = (entry.favorited_by || []).length;
     const reps = (entry.reposted_by || []).length;
-    if (favs < workingSet.length || reps < workingSet.length) newTracks.push(t);
+    if (favs < TARGET_INTERACTIONS || reps < TARGET_INTERACTIONS) newTracks.push(t);
+  }
+
+  // First-run cap: only take the N latest tracks, skip the rest of the backlog
+  const isFirstRun = FORCE_FIRST_RUN || !state.first_run_done;
+  if (isFirstRun) {
+    const sorted = [...newTracks].sort((a, b) => {
+      const at = a.created_at ? Date.parse(a.created_at) : 0;
+      const bt = b.created_at ? Date.parse(b.created_at) : 0;
+      if (at && bt) return bt - at;
+      return 0; // preserve feed order (usually newest-first)
+    });
+    const keep = sorted.slice(0, CFG.firstRunTracks);
+    const skip = sorted.slice(CFG.firstRunTracks);
+    for (const t of skip) {
+      state.fed_tracks[t.id] = {
+        seen_at: new Date().toISOString(),
+        favorited_by: [],
+        reposted_by: [],
+        skipped: true,
+        skip_reason: 'first-run-backlog',
+      };
+    }
+    newTracks = keep;
+    state.first_run_done = true;
+    log(`[*] First run: taking latest ${keep.length}, skipping ${skip.length} older track(s) from backlog.`);
   }
 
   if (!newTracks.length) {
-    if (VERBOSE) log(`[*] Feed: ${tracks.length} tracks, all fully interacted.`);
+    if (VERBOSE) log(`[*] Feed: ${tracks.length} tracks, none need work.`);
     await saveState(sb, ctx, state);
     return;
   }
 
-  const toProcess = newTracks.slice(0, CFG.maxTracksPerRun);
-  log(`[*] Feed: ${tracks.length} tracks, ${newTracks.length} new, processing ${toProcess.length} this run.`);
+  const toProcess = isFirstRun ? newTracks : newTracks.slice(0, CFG.maxTracksPerRun);
+  log(`[*] Feed: ${tracks.length} tracks, ${newTracks.length} pending, processing ${toProcess.length} this run.`);
 
   for (const t of toProcess) {
     if (LOCK_LOST) break;
@@ -731,44 +826,20 @@ async function doFeedInteract(sb, ctx, state, workingSet, primary) {
     }
     const entry = state.fed_tracks[t.id];
 
-    const favTasks = workingSet
-      .filter(a => !entry.favorited_by.includes(a.address))
-      .map(a => () => interactTask(state, t.id, 'favorited_by', a));
-    let rateStopped = await runConcurrent(favTasks, CFG.concurrency);
-    if (rateStopped) {
-      await saveState(sb, ctx, state);
-      log(`[!] Rate limited while favoriting ${t.id}; saving and stopping.`);
-      return;
-    }
-
-    const repTasks = workingSet
-      .filter(a => !entry.reposted_by.includes(a.address))
-      .map(a => () => interactTask(state, t.id, 'reposted_by', a));
-    rateStopped = await runConcurrent(repTasks, CFG.concurrency);
-    if (rateStopped) {
-      await saveState(sb, ctx, state);
-      log(`[!] Rate limited while reposting ${t.id}; saving and stopping.`);
-      return;
-    }
-
+    const favResult = await interactTrackKind(state, t.id, 'favorited_by', pool, TARGET_INTERACTIONS);
     await saveState(sb, ctx, state);
-    log(`[*] Track ${t.id}${t.title ? ` "${t.title.slice(0, 40)}"` : ''} | fav ${entry.favorited_by.length}/${workingSet.length}, repost ${entry.reposted_by.length}/${workingSet.length}`);
+    if (!favResult.done && favResult.reason === 'lock-lost') break;
+
+    const repResult = await interactTrackKind(state, t.id, 'reposted_by', pool, TARGET_INTERACTIONS);
+    await saveState(sb, ctx, state);
+    if (!repResult.done && repResult.reason === 'lock-lost') break;
+
+    const favTag = favResult.done ? '' : ` (${favResult.reason})`;
+    const repTag = repResult.done ? '' : ` (${repResult.reason})`;
+    log(`[*] Track ${t.id}${t.title ? ` "${t.title.slice(0, 40)}"` : ''} | fav ${entry.favorited_by.length}/${TARGET_INTERACTIONS}${favTag}, repost ${entry.reposted_by.length}/${TARGET_INTERACTIONS}${repTag}`);
+
     if (CFG.actionDelayMs) await sleep(CFG.actionDelayMs);
   }
-}
-
-// ============ HELPERS ============
-function ensureHelpers(state, pool, primaryAddress) {
-  const available = pool.filter(a => a.address !== primaryAddress);
-  const map = new Map(available.map(a => [a.address, a]));
-  const kept = (state.helpers || []).filter(addr => map.has(addr));
-  const needed = Math.max(0, CFG.helperCount - kept.length);
-  const existing = new Set(kept);
-  const fresh = shuffle(available.filter(a => !existing.has(a.address)))
-    .slice(0, needed)
-    .map(a => a.address);
-  state.helpers = [...kept, ...fresh];
-  return state.helpers.map(addr => map.get(addr)).filter(Boolean);
 }
 
 // ============ MAIN ============
@@ -790,15 +861,19 @@ async function runTastemaker({ now = new Date() } = {}) {
       .select('t_maker').eq('address', TARGET_ADDRESS).limit(1);
     const state = normalizeTmaker(primaryRow && primaryRow[0] && primaryRow[0].t_maker, ctx.weekStart);
 
-    const pool = await fetchHelperPool(sb, TARGET_ADDRESS);
-    const helpers = ensureHelpers(state, pool, TARGET_ADDRESS);
+    pruneCooldowns(state);
+
+    // Load the FULL helper pool (up to whatever the table has with creds).
+    // Persisted state no longer tracks a fixed "helpers" list — we source
+    // dynamically each run and mark rate-limited accounts in cooldowns.
+    const helpers = await fetchHelperPool(sb, TARGET_ADDRESS);
     if (!helpers.length) {
       log('[!] No helper accounts with creds available.');
-    } else if (helpers.length < CFG.helperCount) {
-      log(`[!] Only ${helpers.length}/${CFG.helperCount} helper accounts available.`);
     }
-    const workingSet = [primary, ...helpers];
-    log(`[*] Working set: primary + ${helpers.length} helper(s) = ${workingSet.length} accounts.`);
+    // Primary first (so it gets priority when available), rest shuffled for fairness.
+    const pool = [primary, ...shuffle(helpers)];
+    const availableNow = pool.filter(a => !isOnCooldown(state, a.address)).length;
+    log(`[*] Pool: ${pool.length} accounts (${availableNow} available, ${pool.length - availableNow} cooling down). Target ${TARGET_INTERACTIONS} interactions per track per action.`);
 
     pruneFedTracks(state);
 
@@ -820,11 +895,11 @@ async function runTastemaker({ now = new Date() } = {}) {
       const remain = Math.round((Date.parse(state.feed_retry_at) - Date.now()) / 1000);
       log(`[*] Feed backoff active (${remain}s remaining, ${state.feed_fail_count} consecutive failures). Skipping feed.`);
     } else {
-      await doFeedInteract(sb, ctx, state, workingSet, primary);
+      await doFeedInteract(sb, ctx, state, pool, primary);
     }
 
     await saveState(sb, ctx, state);
-    return { status: 'OK', helpers: helpers.length };
+    return { status: 'OK', pool: pool.length };
   } finally {
     stopHeartbeat();
     HELD_LOCK = null;
@@ -853,4 +928,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { runTastemaker, buildContext, CFG };
+module.exports = { runTastemaker, buildContext, CFG, TARGET_INTERACTIONS };
