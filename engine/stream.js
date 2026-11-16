@@ -11,6 +11,7 @@ const { AsyncLocalStorage } = require('node:async_hooks');
 const { createClient } = require('@supabase/supabase-js');
 
 const asyncLocalStorage = new AsyncLocalStorage();
+const realFetch = globalThis.fetch; // Save native fetch for bypassing proxy
 
 const DEFAULT_PROXIES = [
   'https://audius-v2.qringgreen.workers.dev',
@@ -26,7 +27,6 @@ const PROXY_URLS = [...new Set(
 )];
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 {
-  const realFetch = globalThis.fetch;
   const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
   const RETRY_STATUS = new Set([502, 503, 504]);
   const downUntil = new Map();
@@ -727,17 +727,32 @@ function countTracks(rows, ctx, runNumber) {
   return counts;
 }
 
-async function fetchTrendingList() {
+async function fetchTrendingList(sdk) {
   try {
-    const res = await fetch("https://api.audius.co/v1/tracks/trending?time=week&limit=100", {
-      headers: { Accept: 'application/json' }
-    });
-    if (!res.ok) return [];
-    const data = await res.json();
-    return data.data || [];
+    log(`[*] Fetching trending tracks via SDK...`);
+    const res = await sdk.tracks.getTrendingTracks({ time: 'week', limit: 100 });
+    const list = res && res.data ? res.data : [];
+    log(`[*] Fetched ${list.length} trending tracks.`);
+    return list;
   } catch (e) {
-    log(`[!] Failed to fetch trending list: ${e.message}`);
-    return [];
+    log(`[!] Failed to fetch trending list via SDK: ${e.message}`);
+    // Fallback to direct REST API without proxy
+    try {
+      log(`[*] Attempting direct fetch to bypass proxy...`);
+      const res = await realFetch("https://api.audius.co/v1/tracks/trending?time=week&limit=100&app_name=audius-client", {
+        headers: { Accept: 'application/json' }
+      });
+      if (!res.ok) {
+        log(`[!] Direct fetch failed: HTTP ${res.status}`);
+        return [];
+      }
+      const data = await res.json();
+      log(`[*] Fetched ${data.data ? data.data.length : 0} trending tracks directly.`);
+      return data.data || [];
+    } catch (e2) {
+      log(`[!] Fallback fetch also failed: ${e2.message}`);
+      return [];
+    }
   }
 }
 
@@ -757,9 +772,11 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   const runDone = countTracks(rows, ctx, runNumber);
 
   // =========================================================
-  // NEW: Fetch Trending & Adjust Targets
+  // Fetch Trending & Adjust Targets
   // =========================================================
-  const trendingTracks = await fetchTrendingList();
+  const readerSdk = makeSdk(reader);
+  const trendingTracks = await fetchTrendingList(readerSdk);
+  
   const rankMap = new Map();
   const ownerMap = new Map();
   const handleMap = new Map();
@@ -778,7 +795,10 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
     // Step A: Previous week tracks in 10-20
     if (rank >= 10 && rank <= 20) {
       const u = t.user || {};
-      const owner = ownerMap.get(String(u.id)) || handleMap.get(String(u.handle).toLowerCase());
+      const userId = u.id || t.user_id;
+      const handle = u.handle || t.handle;
+      const owner = ownerMap.get(String(userId)) || handleMap.get(String(handle).toLowerCase());
+      
       if (owner && !targetAddrs.has(owner.address)) {
         previousTargets.push({
           id: t.id, key: t.id, address: owner.address, handle: owner.handle,
@@ -793,6 +813,7 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
     const rank = rankMap.get(t.id);
     if (rank && rank >= 23 && rank <= 27) inRange++;
   }
+  log(`[*] Currently ${inRange} of our tracks are in the 23-27 range.`);
 
   const filteredTargets = rawTargets.filter(t => {
     const rank = rankMap.get(t.id) || 999;
@@ -802,6 +823,9 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   });
 
   const targets = [...filteredTargets, ...previousTargets];
+  if (previousTargets.length > 0) {
+    log(`[*] Found ${previousTargets.length} previous week track(s) in the 10-20 range.`);
+  }
   // =========================================================
 
   const need = new Map(targets.map(t => {
