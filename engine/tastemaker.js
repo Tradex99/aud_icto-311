@@ -101,6 +101,8 @@ if (!sdkFactory) {
 
 const log = console.log.bind(console);
 const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
+const FORCE_TRENDING = process.argv.includes('--force-trending');
+const FORCE_FEED = process.argv.includes('--force-feed');
 let lastBgLog = 0;
 process.on('unhandledRejection', e => {
   if (Date.now() - lastBgLog < 30000) return;
@@ -145,10 +147,13 @@ const CFG = {
   followDelayMs: Number(process.env.FOLLOW_DELAY_MS || 150),
   concurrency: Number(process.env.CONCURRENCY || 12),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 20) * 1000,
+  feedTimeoutMs: Number(process.env.FEED_TIMEOUT_SECONDS || 15) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
   rateWaitMs: Number(process.env.RATE_WAIT_MS || 3000),
   rateWaitMax: Number(process.env.RATE_WAIT_MAX_MS || 15000),
   loopIntervalMs: Number(process.env.LOOP_INTERVAL_SECONDS || 30) * 1000,
+  feedBackoffBaseMs: Number(process.env.FEED_BACKOFF_BASE_MS || 10000),
+  feedBackoffMaxMs: Number(process.env.FEED_BACKOFF_MAX_MS || 60000),
 };
 
 // ============ UTILITIES ============
@@ -176,7 +181,7 @@ function isTransient(e) {
   const msg = String((e && e.message) || e).toLowerCase();
   const code = String((e && (e.code || (e.cause && e.cause.code))) || '').toUpperCase();
   return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR/.test(code) ||
-    /fetch failed|network|timeout|timed out|socket hang up|temporar|bad gateway|service unavailable|gateway/.test(msg);
+    /fetch failed|network|timeout|timed out|socket hang up|temporar|bad gateway|service unavailable|gateway|aborted/.test(msg);
 }
 
 function classify(e) {
@@ -294,13 +299,6 @@ async function fetchHelperPool(sb, primaryAddress) {
 function sameWeek(raw, weekStart) {
   if (!isObj(raw)) return false;
   if (raw.week_start === weekStart) return true;
-  if (raw.last_trend_check) {
-    const d = new Date(raw.last_trend_check);
-    if (!Number.isNaN(d.getTime())) {
-      const ws = addDays(buildContext(d).weekStart, 0);
-      if (ws === weekStart) return true;
-    }
-  }
   return false;
 }
 
@@ -319,6 +317,8 @@ function normalizeTmaker(raw, weekStart) {
     followed: {},
     fed_tracks: {},
     last_trend_check: null,
+    feed_fail_count: 0,
+    feed_retry_at: null,
   };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
   return h;
@@ -421,7 +421,6 @@ async function releaseLock(sb, ctx, lock) {
 
 async function saveState(sb, ctx, state) {
   await updateTmaker(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-    // Preserve current lock (heartbeat may have moved it)
     const lock = h.lock;
     Object.assign(h, state);
     if (lock) h.lock = lock;
@@ -429,26 +428,46 @@ async function saveState(sb, ctx, state) {
   });
 }
 
-// ============ TRENDING ============
-async function fetchTrending() {
-  const url = `https://api.audius.co/v1/tracks/trending?time=${CFG.trendingTime}&limit=${CFG.trendingMax}`;
+// ============ PROXIED FETCH ============
+// All Audius API calls bypass the SDK for reads. The SDK's discovery-node
+// resolution hits non-proxied hosts, which is what caused the 20s timeouts.
+async function audiusGet(pathname, what, timeoutMs = CFG.callTimeoutMs) {
+  const url = `https://api.audius.co${pathname}`;
   let lastErr;
-  for (let i = 1; i <= 3; i++) {
+  for (let i = 1; i <= CFG.retries; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await withTimeout(fetch(url, { headers: { Accept: 'application/json' } }), CFG.callTimeoutMs, 'trending');
+      const res = await fetch(url, {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
       if (!res.ok) {
-        if (res.status === 429 || res.status >= 500) { await sleep(CFG.rateWaitMs * i); continue; }
-        throw new Error(`HTTP ${res.status}`);
+        if (res.status === 429 || res.status >= 500) {
+          lastErr = Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+          await sleep(CFG.rateWaitMs * i);
+          continue;
+        }
+        throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
       }
       const data = await res.json();
       return (data && data.data) || [];
     } catch (e) {
       lastErr = e;
-      if (i < 3) await sleep(1000 * i);
+      const isAbort = controller.signal.aborted || /abort/i.test(String(e.message || ''));
+      if (isAbort) lastErr = new Error(`timeout after ${timeoutMs / 1000}s`);
+      if (i < CFG.retries) await sleep(1000 * i);
+    } finally {
+      clearTimeout(timer);
     }
   }
-  if (lastErr) log(`[!] Trending fetch failed: ${errMsg(lastErr).slice(0, 60)}`);
-  return [];
+  throw lastErr || new Error(`${what} failed`);
+}
+
+// ============ TRENDING ============
+async function fetchTrending() {
+  const path = `/v1/tracks/trending?time=${CFG.trendingTime}&limit=${CFG.trendingMax}`;
+  return audiusGet(path, 'trending', CFG.callTimeoutMs);
 }
 
 async function isFollowing(sdk, followerId, targetId) {
@@ -486,11 +505,10 @@ async function followUser(sdk, followerId, targetId, styleRef) {
 async function doTrendingFollow(sb, ctx, state, primary) {
   const trending = await fetchTrending();
   if (!trending.length) {
-    log('[!] No trending tracks returned; skipping follow cycle.');
-    state.last_trend_check = new Date().toISOString();
-    await saveState(sb, ctx, state);
+    log('[!] Trending fetch returned empty; will retry next cycle.');
     return;
   }
+
   const artists = [];
   const seen = new Set();
   for (let i = 0; i < trending.length; i++) {
@@ -555,6 +573,7 @@ async function doTrendingFollow(sb, ctx, state, primary) {
 }
 
 function isTrendingDue(state) {
+  if (FORCE_TRENDING) return true;
   if (!state.last_trend_check) return true;
   const last = Date.parse(state.last_trend_check);
   if (!Number.isFinite(last)) return true;
@@ -562,21 +581,9 @@ function isTrendingDue(state) {
 }
 
 // ============ FEED ============
-async function fetchFeed(sdk, userId, limit = CFG.feedLimit) {
-  if (typeof sdk.users.getUserFeed === 'function') {
-    try {
-      const res = await withTimeout(sdk.users.getUserFeed({ id: userId, limit }), CFG.callTimeoutMs, 'getUserFeed');
-      if (res && Array.isArray(res.data)) return res.data;
-    } catch (e) {
-      if (isRateLimit(e)) throw e;
-      if (!/not a function|undefined/i.test(String(e.message))) throw e;
-    }
-  }
-  const url = `https://api.audius.co/v1/users/${userId}/feed?limit=${limit}&app_name=tastemaker`;
-  const res = await withTimeout(fetch(url, { headers: { Accept: 'application/json' } }), CFG.callTimeoutMs, 'feed');
-  if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
-  const data = await res.json();
-  return data.data || [];
+async function fetchFeed(userId, limit = CFG.feedLimit) {
+  const path = `/v1/users/${encodeURIComponent(userId)}/feed?limit=${limit}&app_name=tastemaker`;
+  return audiusGet(path, 'feed', CFG.feedTimeoutMs);
 }
 
 function extractTracks(feedItems) {
@@ -586,13 +593,14 @@ function extractTracks(feedItems) {
     if (!it) continue;
     let t = null;
     if (it.id && it.user) t = it;
-    else if (it.item && it.item.id && it.item.user) t = it.item;
+    else if (it.item && it.item.id) t = it.item;
+    else if (it.item_id) t = { id: it.item_id, user: it.user || {} };
     else if (it.track_id) t = { id: it.track_id, user: it.user || {} };
     if (!t) continue;
     const id = String(t.id);
     if (seen.has(id)) continue;
     seen.add(id);
-    out.push({ id, user: t.user || {}, title: t.title || '', created_at: t.created_at || t.release_date });
+    out.push({ id, user: t.user || {}, title: t.title || '', created_at: t.created_at || t.release_date || null });
   }
   return out;
 }
@@ -611,7 +619,7 @@ function pruneFedTracks(state) {
   state.fed_tracks = Object.fromEntries(kept);
 }
 
-async function interactTask(workingSet, state, trackId, kind, acct) {
+async function interactTask(state, trackId, kind, acct) {
   const entry = state.fed_tracks[trackId];
   const list = entry[kind];
   if (list.includes(acct.address)) return { status: 'skip' };
@@ -628,7 +636,6 @@ async function interactTask(workingSet, state, trackId, kind, acct) {
   } catch (e) {
     if (isRateLimit(e)) return { status: 'rate', error: e };
     if (classify(e) === 'permanent') {
-      // Treat as done to prevent endless retries
       list.push(acct.address);
       return { status: 'perm', error: e };
     }
@@ -657,18 +664,45 @@ async function runConcurrent(tasks, concurrency, onRateLimit) {
   return stop;
 }
 
+function shouldSkipFeed(state) {
+  if (FORCE_FEED) return false;
+  if (!state.feed_retry_at) return false;
+  const t = Date.parse(state.feed_retry_at);
+  if (!Number.isFinite(t)) return false;
+  return Date.now() < t;
+}
+
+function recordFeedFailure(state) {
+  state.feed_fail_count = (state.feed_fail_count || 0) + 1;
+  const backoff = Math.min(
+    CFG.feedBackoffBaseMs * 2 ** (state.feed_fail_count - 1),
+    CFG.feedBackoffMaxMs
+  );
+  state.feed_retry_at = new Date(Date.now() + backoff).toISOString();
+  return backoff;
+}
+
+function recordFeedSuccess(state) {
+  state.feed_fail_count = 0;
+  state.feed_retry_at = null;
+}
+
 async function doFeedInteract(sb, ctx, state, workingSet, primary) {
-  const primarySdk = makeSdk(primary);
   let feedItems;
   try {
-    feedItems = await fetchFeed(primarySdk, primary.user_id, CFG.feedLimit);
+    feedItems = await fetchFeed(primary.user_id, CFG.feedLimit);
   } catch (e) {
-    log(`[!] Feed fetch failed: ${errMsg(e).slice(0, 60)}`);
+    const backoff = recordFeedFailure(state);
+    await saveState(sb, ctx, state);
+    log(`[!] Feed fetch failed (attempt ${state.feed_fail_count}, retry in ${Math.round(backoff / 1000)}s): ${errMsg(e).slice(0, 60)}`);
     return;
   }
+  recordFeedSuccess(state);
+
   const tracks = extractTracks(feedItems);
   if (!tracks.length) {
     if (VERBOSE) log('[*] Feed empty.');
+    await saveState(sb, ctx, state);
     return;
   }
 
@@ -682,7 +716,8 @@ async function doFeedInteract(sb, ctx, state, workingSet, primary) {
   }
 
   if (!newTracks.length) {
-    if (VERBOSE) log(`[*] Feed: ${tracks.length} tracks, all already fully interacted.`);
+    if (VERBOSE) log(`[*] Feed: ${tracks.length} tracks, all fully interacted.`);
+    await saveState(sb, ctx, state);
     return;
   }
 
@@ -696,25 +731,23 @@ async function doFeedInteract(sb, ctx, state, workingSet, primary) {
     }
     const entry = state.fed_tracks[t.id];
 
-    // Favorites
     const favTasks = workingSet
       .filter(a => !entry.favorited_by.includes(a.address))
-      .map(a => () => interactTask(workingSet, state, t.id, 'favorited_by', a));
+      .map(a => () => interactTask(state, t.id, 'favorited_by', a));
     let rateStopped = await runConcurrent(favTasks, CFG.concurrency);
     if (rateStopped) {
       await saveState(sb, ctx, state);
-      log(`[!] Rate limited while favoriting track ${t.id}; saving and stopping.`);
+      log(`[!] Rate limited while favoriting ${t.id}; saving and stopping.`);
       return;
     }
 
-    // Reposts
     const repTasks = workingSet
       .filter(a => !entry.reposted_by.includes(a.address))
-      .map(a => () => interactTask(workingSet, state, t.id, 'reposted_by', a));
+      .map(a => () => interactTask(state, t.id, 'reposted_by', a));
     rateStopped = await runConcurrent(repTasks, CFG.concurrency);
     if (rateStopped) {
       await saveState(sb, ctx, state);
-      log(`[!] Rate limited while reposting track ${t.id}; saving and stopping.`);
+      log(`[!] Rate limited while reposting ${t.id}; saving and stopping.`);
       return;
     }
 
@@ -753,12 +786,10 @@ async function runTastemaker({ now = new Date() } = {}) {
   const stopHeartbeat = startHeartbeat(sb, ctx);
 
   try {
-    // Load state fresh (we hold the lock)
     const { data: primaryRow } = await sb.from('audius')
       .select('t_maker').eq('address', TARGET_ADDRESS).limit(1);
     const state = normalizeTmaker(primaryRow && primaryRow[0] && primaryRow[0].t_maker, ctx.weekStart);
 
-    // Ensure helpers
     const pool = await fetchHelperPool(sb, TARGET_ADDRESS);
     const helpers = ensureHelpers(state, pool, TARGET_ADDRESS);
     if (!helpers.length) {
@@ -771,10 +802,13 @@ async function runTastemaker({ now = new Date() } = {}) {
 
     pruneFedTracks(state);
 
-    // Trending follow cycle (5h)
     if (isTrendingDue(state)) {
       log(`[*] Trending follow cycle due (last: ${state.last_trend_check || 'never'}).`);
-      await doTrendingFollow(sb, ctx, state, primary);
+      try {
+        await doTrendingFollow(sb, ctx, state, primary);
+      } catch (e) {
+        log(`[!] Trending cycle failed; will retry next run: ${errMsg(e).slice(0, 80)}`);
+      }
     } else {
       const next = new Date(Date.parse(state.last_trend_check) + CFG.trendingCheckMs);
       if (VERBOSE) log(`[*] Trending cycle next due: ${next.toISOString()}.`);
@@ -782,8 +816,12 @@ async function runTastemaker({ now = new Date() } = {}) {
 
     if (LOCK_LOST) throw LOCK_LOST;
 
-    // Feed interaction cycle (every 30s)
-    await doFeedInteract(sb, ctx, state, workingSet, primary);
+    if (shouldSkipFeed(state)) {
+      const remain = Math.round((Date.parse(state.feed_retry_at) - Date.now()) / 1000);
+      log(`[*] Feed backoff active (${remain}s remaining, ${state.feed_fail_count} consecutive failures). Skipping feed.`);
+    } else {
+      await doFeedInteract(sb, ctx, state, workingSet, primary);
+    }
 
     await saveState(sb, ctx, state);
     return { status: 'OK', helpers: helpers.length };
