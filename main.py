@@ -7,6 +7,7 @@ Usage: python3 main.py                run the full pipeline, one script after an
 Example: python3 main.py follower.js
          python3 main.py follower.js id=2     (follower booster, runs until stopped)
          python3 main.py repost.js
+         python3 main.py tastemaker.js        (runs tastemaker standalone)
 """
 
 import asyncio
@@ -28,6 +29,9 @@ BOOST_SHOW_LOGS = False
 
 # Prefix added to every follower.js id=2 log line so it is easy to tell apart ("" to disable)
 BOOST_LOG_PREFIX = "[boost] "
+
+TASTEMAKER_ENABLED = True
+TASTEMAKER_SHOW_LOGS = False
 
 PIPELINE_SHOW_LOGS = False
 
@@ -174,7 +178,10 @@ async def run_pipeline():
     boost_stopper = None
     boost_holder = {}
     boost_started = False
-    
+
+    tastemaker_task = None
+    tastemaker_holder = {}
+
     # Determine if the pipeline should be silent based on the toggle
     pipeline_silent = not PIPELINE_SHOW_LOGS
 
@@ -186,17 +193,29 @@ async def run_pipeline():
                 print(f"[*] Skipping {name} (disabled)", flush=True)
             continue
 
-        # Launch stream.js in the background when upload_track.js starts
-        if name == "upload_track.js" and STREAM_ENABLED:
-            if not pipeline_silent or STREAM_SHOW_LOGS:
-                print(f"[*] Starting stream.js in the background...", flush=True)
-                if not STREAM_SHOW_LOGS:
-                    print(f"[*] (stream.js logs are muted)", flush=True)
-            
-            # Create the background task without blocking the loop
-            stream_task = asyncio.create_task(
-                run_module("stream.js", silent=not STREAM_SHOW_LOGS)
-            )
+        # At upload_track.js: launch stream.js and tastemaker.js together in the background
+        if name == "upload_track.js":
+            if STREAM_ENABLED:
+                if not pipeline_silent or STREAM_SHOW_LOGS:
+                    print(f"[*] Starting stream.js in the background...", flush=True)
+                    if not STREAM_SHOW_LOGS:
+                        print(f"[*] (stream.js logs are muted)", flush=True)
+
+                # Create the background task without blocking the loop
+                stream_task = asyncio.create_task(
+                    run_module("stream.js", silent=not STREAM_SHOW_LOGS)
+                )
+
+            if TASTEMAKER_ENABLED:
+                if not pipeline_silent or TASTEMAKER_SHOW_LOGS:
+                    print(f"[*] Starting tastemaker.js in the background...", flush=True)
+                    if not TASTEMAKER_SHOW_LOGS:
+                        print(f"[*] (tastemaker.js logs are muted)", flush=True)
+
+                tastemaker_task = asyncio.create_task(
+                    run_module("tastemaker.js", silent=not TASTEMAKER_SHOW_LOGS,
+                               holder=tastemaker_holder)
+                )
 
         # With the normal follower.js step disabled there is nothing to conflict with,
         # so the booster can start right away
@@ -219,7 +238,7 @@ async def run_pipeline():
         # Only print this status message if at least one logging channel is active
         if not pipeline_silent or STREAM_SHOW_LOGS:
             print(f"\n[*] Main pipeline finished. Waiting for background stream.js to complete...", flush=True)
-            
+
         try:
             stream_code = await stream_task
             if stream_code != 0:
@@ -232,12 +251,24 @@ async def run_pipeline():
             if not pipeline_silent or STREAM_SHOW_LOGS:
                 print(f"[!] Error in background stream.js: {e}", flush=True)
 
-    # stream.js is done (or was never started): make sure the follower booster is stopped
+    # stream.js is done (or was never started): stop all background tasks.
+    # Tastemaker and the follower booster both run until stream.js finishes,
+    # so we stop them in parallel here for a fast shutdown.
+    background_stops = []
+    if tastemaker_task:
+        background_stops.append(
+            stop_background(tastemaker_task, tastemaker_holder, "tastemaker.js", TASTEMAKER_SHOW_LOGS)
+        )
     if boost_task:
         if boost_stopper:
-            await boost_stopper
+            background_stops.append(boost_stopper)
         else:
-            await stop_background(boost_task, boost_holder, "follower.js id=2", BOOST_SHOW_LOGS)
+            background_stops.append(
+                stop_background(boost_task, boost_holder, "follower.js id=2", BOOST_SHOW_LOGS)
+            )
+
+    if background_stops:
+        await asyncio.gather(*background_stops)
 
     if failed and not pipeline_silent:
         print(f"[!] Pipeline finished with errors in: {', '.join(failed)}", flush=True)
