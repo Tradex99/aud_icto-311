@@ -57,7 +57,6 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     let statusTries = 0;
     
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-      // Check if the current worker has an assigned proxy that is still healthy
       const assigned = asyncLocalStorage.getStore()?.proxy;
       const isAssignedHealthy = assigned && (downUntil.get(assigned) || 0) <= Date.now();
       
@@ -149,8 +148,7 @@ const CFG = {
   assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
   callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  workerCount: 10, // UPDATED: 10 workers
-  // Stagger config - 5s between each worker + small random jitter
+  workerCount: 10,
   workerStaggerMs: Number(process.env.WORKER_STAGGER_MS || 5000),
   workerJitterMs: Number(process.env.WORKER_JITTER_MS || 2000),
 };
@@ -658,13 +656,9 @@ async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
   let stopWorkers = false;
 
   const worker = async (id) => {
-    // Split the proxies across the workers. Workers 1-6 get proxies 1-6. 
-    // Workers 7-10 wrap around and get proxies 1-4.
     const proxy = PROXY_URLS[(id - 1) % PROXY_URLS.length];
     
     return asyncLocalStorage.run({ proxy }, async () => {
-      // Stagger each worker by (id-1) * workerStaggerMs + random jitter
-      // Worker 1: 0s, Worker 2: ~5s, ... Worker 10: ~45s
       const staggerDelay = (id - 1) * CFG.workerStaggerMs + Math.floor(Math.random() * CFG.workerJitterMs);
       
       log(`[worker${id}] Streaming ${target.id} | target ${maxOk} (starting in ${(staggerDelay / 1000).toFixed(1)}s)`);
@@ -733,7 +727,21 @@ function countTracks(rows, ctx, runNumber) {
   return counts;
 }
 
-async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
+async function fetchTrendingList() {
+  try {
+    const res = await fetch("https://api.audius.co/v1/tracks/trending?time=week&limit=100", {
+      headers: { Accept: 'application/json' }
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.data || [];
+  } catch (e) {
+    log(`[!] Failed to fetch trending list: ${e.message}`);
+    return [];
+  }
+}
+
+async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
     user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r),
@@ -742,11 +750,59 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   const reader = accounts.find(a => a.hasCreds);
   if (!reader) throw new Error('no account with complete credentials');
 
-  const targetAddrs = new Set(targets.map(p => p.address).filter(Boolean));
+  const targetAddrs = new Set(rawTargets.map(p => p.address).filter(Boolean));
   const excluded = new Set(accounts.filter(a => targetAddrs.has(a.address)).map(a => a.address));
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
+
+  // =========================================================
+  // NEW: Fetch Trending & Adjust Targets
+  // =========================================================
+  const trendingTracks = await fetchTrendingList();
+  const rankMap = new Map();
+  const ownerMap = new Map();
+  const handleMap = new Map();
+  
+  accounts.forEach(a => {
+    if (a.user_id) ownerMap.set(String(a.user_id), a);
+    if (a.handle) handleMap.set(a.handle.toLowerCase(), a);
+  });
+
+  const previousTargets = [];
+
+  trendingTracks.forEach((t, i) => {
+    const rank = i + 1;
+    rankMap.set(t.id, rank);
+    
+    // Step A: Previous week tracks in 10-20
+    if (rank >= 10 && rank <= 20) {
+      const u = t.user || {};
+      const owner = ownerMap.get(String(u.id)) || handleMap.get(String(u.handle).toLowerCase());
+      if (owner && !targetAddrs.has(owner.address)) {
+        previousTargets.push({
+          id: t.id, key: t.id, address: owner.address, handle: owner.handle,
+          date: 'previous', cap: 1000, maxPerRun: 100
+        });
+      }
+    }
+  });
+
+  let inRange = 0;
+  for (const t of rawTargets) {
+    const rank = rankMap.get(t.id);
+    if (rank && rank >= 23 && rank <= 27) inRange++;
+  }
+
+  const filteredTargets = rawTargets.filter(t => {
+    const rank = rankMap.get(t.id) || 999;
+    if (rank < 23) return false; // Too high
+    if (rank >= 23 && rank <= 27 && inRange >= 5) return false; // We have enough in range
+    return true;
+  });
+
+  const targets = [...filteredTargets, ...previousTargets];
+  // =========================================================
 
   const need = new Map(targets.map(t => {
     const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
