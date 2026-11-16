@@ -828,7 +828,7 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
     if (rank < CFG.trendingTopMin || rank > CFG.trendingTopMax) return;
     if (targetTrackIds.has(t.id) || previousSeen.has(t.id)) return;
     const u = t.user || {};
-    const owner = ownerMap.get(String(u.id)) || handleMap.get(String((u.handle || '').toLowerCase())];
+    const owner = ownerMap.get(String(u.id)) || handleMap.get(String((u.handle || '').toLowerCase()));
     if (!owner) return;
     previousSeen.add(t.id);
     previousTargets.push({
