@@ -72,6 +72,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
+<<<<<<< HEAD
           echo "Starting Audius monitor..."
           date -u
 
@@ -80,6 +81,12 @@ jobs:
 
           echo "Audius monitor finished."
           date -u
+=======
+          timeout 355m xvfb-run -a \
+            --server-args="-screen 0 1280x720x24" \
+            python3 -u main.py com_profile.js || true
+
+>>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       - name: Trigger the next run
         if: always()
         env:
