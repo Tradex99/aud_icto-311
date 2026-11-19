@@ -56,11 +56,9 @@ const CFG = {
   accountsPerDay: 10,            // accounts published per batch (one track each)
   tracksPerDay: 10,              // tracks generated per batch: one unique track per account
   trackBatchSize: 3,             // generated as 3 + 3 + 3 + 1; each batch is downloaded before the next starts
-  maxPriorityPerBatch: 7,        // up to 7 priority accounts per batch; the remaining slots are random
   // One batch per week. A week runs from Friday 12:00 PM Pacific to the next Friday 11:59 AM, and the
   // batch is published whenever the script runs at or after the reset time and the week has no batch yet.
   forceRun: process.env.FORCE_RUN === '1', // start another batch even though this week's batch exists
-  priorityHandles: ['qring', 'obi350965', '7ebe3e67', '904c4687', '4c9ebc6a', 'd71a941b', 'a8cde724', 'b41ba8a6', 'e8b592ac'],
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   // A lock of unknown ownership with no data recorded for today is treated as stale after this long (0 = off).
   lockIdleMs: Number(process.env.LOCK_IDLE_MINUTES ?? 10) * 60000,
@@ -284,6 +282,8 @@ function normalizeHistory(raw, weekStart) {
   }
   const h = { week_start: weekStart, days: [] }; // new week (or default []): previous history dropped
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
+  if (isObj(raw) && Array.isArray(raw.used_accounts)) h.used_accounts = [...raw.used_accounts]; // kept across weeks
+  if (isObj(raw) && Array.isArray(raw.has_tracks)) h.has_tracks = [...raw.has_tracks];         // kept across weeks
   return h;
 }
 
@@ -372,6 +372,7 @@ async function upsertEntry(sb, ctx, address, patch) {
     } else {
       hist.days.push(cleanEntry({ ...patch, address }));
     }
+    if (!(hist.used_accounts || []).includes(address)) hist.used_accounts = [...(hist.used_accounts || []), address];
     return true;
   });
   const saved = stored.days.find(sameEntry);
@@ -516,7 +517,6 @@ function buildAccounts(rows, ctx) {
     const handle = detectHandle(r);
     return {
       address: r.address, user_id: r.user_id, app_data: r.app_data, handle,
-      isPriority: !!handle && CFG.priorityHandles.includes(handle.toLowerCase()),
       hasCreds: hasCreds(r), history,
       todayEntry: history.days.find(d => d.date === ctx.today) || null,
       successCount: history.days.filter(d => d.status === 'success').length,
@@ -537,44 +537,48 @@ function makeSdk(acct) {
   });
 }
 
-// Safety net: if a priority account's audius.handle is empty, find it via the Audius API.
-async function resolvePriorityAccounts(accounts) {
-  const found = new Set(accounts.filter(a => a.isPriority).map(a => a.handle.toLowerCase()));
-  const missing = CFG.priorityHandles.filter(h => !found.has(h));
-  if (!missing.length) return;
-  const reader = accounts.find(a => a.hasCreds);
-  if (!reader) return;
-  const sdk = makeSdk(reader);
-  for (const h of missing) {
-    try {
-      const res = await withRetry(`lookup @${h}`, () => sdk.users.getUserByHandle({ handle: h }));
-      const id = res && res.data && res.data.id;
-      const acct = id && accounts.find(a => a.user_id === id);
-      if (acct) { acct.handle = h; acct.isPriority = true; }
-      else log(`[!] Priority handle @${h} was not found among the audius table accounts.`);
-    } catch (e) {
-      log(`[!] Could not look up priority handle @${h}: ${e.message || e}`);
-    }
-  }
+// Does this account already have tracks on Audius? (any public track counts)
+async function hasUploadedTracks(acct) {
+  const res = await withRetry(`check uploads ${acct.handle || acct.address}`, () => makeSdk(acct).users.getTracksByUser({ id: acct.user_id, limit: 1 }));
+  return !!(res && Array.isArray(res.data) && res.data.length);
 }
 
-// Each batch: up to CFG.maxPriorityPerBatch priority accounts, the rest random.
-// Priority accounts with the fewest uploads this week go first (ties are random), so the
-// 9 priority accounts rotate fairly across the two weekly batches. If fewer priority
-// accounts are available, the shortfall is filled from the random pool.
-function chooseAccounts(accounts, ctx, need, blocked, todayAccounts = []) {
-  const priorityRoom = Math.max(0, CFG.maxPriorityPerBatch - todayAccounts.filter(a => a.isPriority).length);
-  const eligible = accounts.filter(a => a.isPriority && !a.todayEntry && !blocked.has(a.address));
-  eligible.filter(a => !a.hasCreds).forEach(a => log(`[!] Priority account @${a.handle} has incomplete credentials; skipping it.`));
-  const picked = shuffle(eligible.filter(a => a.hasCreds))
-    .sort((a, b) => a.successCount - b.successCount)
-    .slice(0, Math.min(need, priorityRoom));
-  const slots = need - picked.length;
-  const pool = accounts.filter(a => !a.isPriority && a.hasCreds && !a.todayEntry && a.successCount === 0 && !blocked.has(a.address));
-  if (pool.length < slots) {
-    throw new Error(`Not enough eligible accounts: need ${slots} more random account(s) but only ${pool.length} have not published this week.`);
+// 100% random selection. An account is never picked if it was selected in a previous week (used_accounts)
+// or is known to have uploaded tracks (has_tracks). Each randomly drawn account is then checked on Audius:
+// accounts that already have tracks are dropped (and remembered), the rest are used. Drawing continues
+// until `need` accounts without any uploaded track are found.
+async function chooseAccounts(sb, accounts, ctx, need, blocked, hist) {
+  const used = new Set([...(hist.used_accounts || []), ...accounts.filter(a => a.history.days.length).map(a => a.address)]);
+  const hasTracks = new Set(hist.has_tracks || []);
+  const pool = shuffle(accounts.filter(a => a.hasCreds && !a.todayEntry && a.successCount === 0 && !blocked.has(a.address) && !used.has(a.address) && !hasTracks.has(a.address)));
+  const picked = [];
+  const dropped = [];
+  let unchecked = 0;
+  let i = 0;
+  while (picked.length < need && i < pool.length) {
+    const chunk = pool.slice(i, i + (need - picked.length));
+    i += chunk.length;
+    for (const acct of chunk) {
+      try {
+        if (await hasUploadedTracks(acct)) dropped.push(acct); else picked.push(acct);
+      } catch (e) {
+        unchecked++;
+        log(`[!] Could not check uploaded tracks for ${acct.handle || acct.address}; skipping it: ${e.message || e}`);
+      }
+    }
   }
-  return shuffle([...picked, ...shuffle(pool).slice(0, slots)]);
+  if (dropped.length) {
+    await updateHistory(sb, ctx.weekStart, h => {
+      const known = new Set(h.has_tracks || []);
+      dropped.forEach(a => known.add(a.address));
+      h.has_tracks = [...known];
+    });
+    log(`[*] Dropped ${dropped.length} randomly drawn account(s) that already have uploaded tracks.`);
+  }
+  if (picked.length < need) {
+    throw new Error(`Not enough eligible accounts: need ${need} more account(s) without uploaded tracks, found ${picked.length} (${dropped.length} had tracks, ${unchecked} could not be checked, ${pool.length - i} left unchecked).`);
+  }
+  return picked;
 }
 
 // One unique track per account, always with the track's original title.
@@ -928,11 +932,6 @@ function printSummary(ctx, accounts, tracksCount, status, failures) {
   log(`Tracks published: ${ok.length}\n`);
   log(`Successful uploads: ${ok.length}`);
   log(`Failed uploads: ${bad.length}\n`);
-  log('Priority accounts:');
-  for (const h of CFG.priorityHandles) {
-    const a = accounts.find(x => x.handle && x.handle.toLowerCase() === h);
-    log(`${h}: ${a ? `${a.successCount} upload(s) this week` : 'account not found'}`);
-  }
   if (bad.length) {
     log('\nFailed accounts:');
     for (const a of bad) {
@@ -984,15 +983,14 @@ async function runDaily({ now = new Date() } = {}) {
       log(ALREADY_DONE_MSG);
       return { status: 'ALREADY_COMPLETED' };
     }
-    await resolvePriorityAccounts(accounts);
-
     // 4. Work out who still has to be published today.
     const todayAccounts = accounts.filter(a => a.todayEntry);
     const pending = todayAccounts.filter(a => a.todayEntry.status !== 'success' && !blocked.has(a.address));
     const needMore = CFG.accountsPerDay - todayAccounts.length;
     let selected = [];
     try {
-      selected = needMore > 0 ? chooseAccounts(accounts, ctx, needMore, blocked, todayAccounts) : [];
+      const hist = normalizeHistory((rows.find(r => r.address === TARGET_ADDRESS) || {}).up_tracks, ctx.weekStart);
+      selected = needMore > 0 ? await chooseAccounts(sb, accounts, ctx, needMore, blocked, hist) : [];
     } catch (e) {
       console.error(`[!] ${e.message}`);
       return { status: 'ABORTED' };
@@ -1035,7 +1033,7 @@ async function runDaily({ now = new Date() } = {}) {
     const queue = pending.map(a => ({ acct: a, entry: a.todayEntry }));
     if (selected.length) {
       for (const a of selected) {
-        if (!a.handle && !a.isPriority) {
+        if (!a.handle) {
           try { a.handle = await resolveHandle(makeSdk(a), a.user_id); } catch (_) {}
         }
       }
@@ -1051,7 +1049,7 @@ async function runDaily({ now = new Date() } = {}) {
 
     log(`\n[+] Today's accounts to publish (${queue.length}):`);
     queue.forEach(({ acct, entry }, i) => log(
-      `    ${String(i + 1).padStart(2)}. ${acct.handle || acct.address}${acct.isPriority ? ' [priority]' : ''}  -> ${entry.generated_track}  "${entry.published_title}"`));
+      `    ${String(i + 1).padStart(2)}. ${acct.handle || acct.address}  -> ${entry.generated_track}  "${entry.published_title}"`));
 
     // 8. Publish sequentially, each account with its own credentials.
     const usedDescriptions = new Set();
@@ -1100,4 +1098,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runDaily, buildContext, chooseAccounts, assignNewAccounts, batchSizes };
+module.exports = { runDaily, buildContext, chooseAccounts, assignNewAccounts, batchSizes, normalizeHistory, upsertEntry };

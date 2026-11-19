@@ -132,6 +132,7 @@ process.on('uncaughtException', (err) => {
 
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DB_FILE = path.join(ROOT_DIR, 'db.txt');
+<<<<<<< HEAD
 const MAX_RETRIES = 5;
 const PENDING_MODE = process.argv.includes('--pending');
 const CLAIM_MODE = process.argv.includes('--claim');
@@ -189,6 +190,14 @@ const API_BASE = process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1';
 const BASE_DELAY_MS = 1000;
 const PAGE_SIZE = Number(process.env.UNDISBURSED_PAGE_SIZE || 100);
 const MAX_PAGES = Number(process.env.UNDISBURSED_MAX_PAGES || 20);
+=======
+const MAX_RETRIES = 5;           // retries per API call on 429 / 5xx / network errors
+const PENDING_MODE = process.argv.includes('--pending'); // node balance_checker.js --pending
+const PENDING_CONCURRENCY = 5;   // accounts checked at the same time in --pending mode
+const AMOUNT_DECIMALS = 0;       // set to 8 if reward amounts come back in raw units (e.g. 100000000)
+const API_BASE = process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1';
+const BASE_DELAY_MS = 1000;      // backoff: 1s, 2s, 4s, 8s, 16s (+ jitter)
+>>>>>>> d9e7a2c (Add files via upload)
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -228,6 +237,10 @@ async function withRetry(fn) {
   }
 }
 
+<<<<<<< HEAD
+=======
+// --- Pending rewards (--pending) ---
+>>>>>>> d9e7a2c (Add files via upload)
 const DAY_MS = 86400000;
 
 function toMs(v) {
@@ -238,6 +251,7 @@ function toMs(v) {
   return Number.isFinite(t) ? t : null;
 }
 
+<<<<<<< HEAD
 function pickField(obj, ...names) {
   if (!obj || typeof obj !== 'object') return undefined;
   for (const name of names) {
@@ -486,6 +500,9 @@ function amountOf(raw) {
   return n / Math.pow(10, AMOUNT_DECIMALS);
 }
 
+=======
+const amountOf = (raw) => { const n = Number(raw) / Math.pow(10, AMOUNT_DECIMALS); return Number.isFinite(n) ? n : 0; };
+>>>>>>> d9e7a2c (Add files via upload)
 const plainAmount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
 const fmtAmount = (n) => `${plainAmount(n)} $AUDIO`;
 
@@ -496,6 +513,7 @@ function fmtLeft(ms) {
   return d ? (h ? `${d}d ${h}h` : `${d}d`) : `${h}h`;
 }
 
+<<<<<<< HEAD
 async function fetchUndisbursedPage(appData, userId, offset, limit) {
   const qs = new URLSearchParams({
     limit: String(limit),
@@ -503,11 +521,18 @@ async function fetchUndisbursedPage(appData, userId, offset, limit) {
     api_key: appData.api_key,
     app_name: 'balance_checker',
   });
+=======
+// Completed but unpaid rewards: "pending" while the cooldown (completed_at + cooldown_days) has not
+// passed, "ready to claim" afterwards (or when there is no cooldown).
+async function fetchUndisbursed(appData, userId) {
+  const qs = new URLSearchParams({ limit: '100', api_key: appData.api_key, app_name: 'balance_checker' });
+>>>>>>> d9e7a2c (Add files via upload)
   const headers = { Accept: 'application/json' };
   if (appData.bearer_token) headers.Authorization = `Bearer ${appData.bearer_token}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
+<<<<<<< HEAD
     const res = await fetch(`${API_BASE}/challenges/undisbursed/${userId}?${qs}`, {
       headers,
       signal: controller.signal,
@@ -522,11 +547,18 @@ async function fetchUndisbursedPage(appData, userId, offset, limit) {
     if (json && json.data && Array.isArray(json.data.results)) return json.data.results;
     if (DEBUG) log(`  [debug] unrecognized response shape for user ${userId}: ${JSON.stringify(json).slice(0, 200)}`);
     return [];
+=======
+    const res = await fetch(`${API_BASE}/challenges/undisbursed/${userId}?${qs}`, { headers, signal: controller.signal });
+    if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+    const json = await res.json();
+    return Array.isArray(json && json.data) ? json.data : [];
+>>>>>>> d9e7a2c (Add files via upload)
   } finally {
     clearTimeout(timer);
   }
 }
 
+<<<<<<< HEAD
 async function fetchUndisbursed(appData, userId) {
   const all = [];
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -566,11 +598,23 @@ function classifyRewards(list, now) {
     } else {
       out.ready.push({ amount, raw: r });
     }
+=======
+function classifyRewards(list, now) {
+  const out = { ready: [], pending: [] };
+  for (const r of list) {
+    const amount = amountOf(r.amount);
+    const done = toMs(r.completed_at) ?? toMs(r.created_at);
+    const cooldown = Number(r.cooldown_days) || 0;
+    const readyAt = done === null ? null : done + cooldown * DAY_MS;
+    if (readyAt !== null && readyAt > now) out.pending.push({ amount, left: readyAt - now });
+    else out.ready.push({ amount });
+>>>>>>> d9e7a2c (Add files via upload)
   }
   out.pending.sort((a, b) => a.left - b.left);
   return out;
 }
 
+<<<<<<< HEAD
 async function claimReward(appData, userId, challengeId, specifier) {
   const body = { userId, challengeId, specifier };
 
@@ -690,10 +734,17 @@ async function checkPending(accounts) {
 
   const queue = filtered.filter(a => a.user_id && a.app_data && a.app_data.api_key);
   const skipped = filtered.length - queue.length;
+=======
+async function checkPending(accounts) {
+  const now = Date.now();
+  const queue = accounts.filter(a => a.user_id && a.app_data && a.app_data.api_key);
+  const skipped = accounts.length - queue.length;
+>>>>>>> d9e7a2c (Add files via upload)
   const results = [];
   const reasons = new Map();
   let errors = 0;
 
+<<<<<<< HEAD
   if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
 
   const sum = (list) => list.reduce((n, x) => n + x.amount, 0);
@@ -713,11 +764,14 @@ async function checkPending(accounts) {
 
   let accountsWithReady = [];
 
+=======
+>>>>>>> d9e7a2c (Add files via upload)
   const worker = async () => {
     while (queue.length) {
       const acc = queue.shift();
       try {
         const list = await withRetry(() => fetchUndisbursed(acc.app_data, acc.user_id));
+<<<<<<< HEAD
         const classified = classifyRewards(list, now);
         const result = { address: acc.address, records: list, ...classified };
         results.push(result);
@@ -734,11 +788,20 @@ async function checkPending(accounts) {
         const why = describeError(e);
         reasons.set(why, (reasons.get(why) || 0) + 1);
         log(`[!] [${acc.address}] check failed: ${why}`);
+=======
+        results.push({ address: acc.address, ...classifyRewards(list, now) });
+      } catch (e) {
+        errors++;
+        const status = getStatus(e);
+        const why = status ? `HTTP ${status}` : String(e.message || e).slice(0, 40);
+        reasons.set(why, (reasons.get(why) || 0) + 1);
+>>>>>>> d9e7a2c (Add files via upload)
       }
     }
   };
   await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, worker));
 
+<<<<<<< HEAD
   const withRewards = results.filter(x => x.ready.length || x.pending.length);
   const none = results.length - withRewards.length;
   const errorText = `${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`;
@@ -871,6 +934,36 @@ async function checkPending(accounts) {
   }
 }
 
+=======
+  const sum = (list) => list.reduce((n, x) => n + x.amount, 0);
+  const withRewards = results.filter(x => x.ready.length || x.pending.length);
+  withRewards.sort((a, b) => sum(b.ready) - sum(a.ready) ||
+    (a.pending[0] ? a.pending[0].left : Infinity) - (b.pending[0] ? b.pending[0].left : Infinity));
+
+  for (const x of withRewards) {
+    const parts = [];
+    if (x.ready.length) parts.push(`ready to claim ${fmtAmount(sum(x.ready))}`);
+    if (x.pending.length === 1) parts.push(`pending ${fmtAmount(x.pending[0].amount)}, ${fmtLeft(x.pending[0].left)} left`);
+    else if (x.pending.length) parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
+    log(`[${x.address}] ${parts.join(' | ')}`);
+  }
+
+  const allReady = results.flatMap(x => x.ready);
+  const allPending = results.flatMap(x => x.pending);
+  const summary = [
+    `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts`,
+    `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts`,
+  ];
+  if (allPending.length) summary.push(`next unlock in ${fmtLeft(allPending.reduce((m, p) => Math.min(m, p.left), Infinity))}`);
+  const none = results.length - withRewards.length;
+  if (none) summary.push(`${none} with nothing to claim`);
+  if (errors) summary.push(`${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
+  if (skipped) summary.push(`${skipped} without credentials`);
+  log(`[*] Pending rewards: ${summary.join(' | ')}.`);
+}
+
+// --- Check Single Account ---
+>>>>>>> d9e7a2c (Add files via upload)
 async function checkAccount(supabase, account) {
   const address = account.address;
   const userId = account.user_id;
@@ -1021,12 +1114,26 @@ async function main() {
     return;
   }
 
+<<<<<<< HEAD
   if (PENDING_MODE || CLAIM_MODE) {
     const modeLabel = CLAIM_MODE ? 'claim' : 'pending';
     log(`[*] Checking ${modeLabel} rewards for ${accounts.length} account(s) (page size ${PAGE_SIZE})...`);
     await checkPending(accounts);
     log(`[*] ${modeLabel.charAt(0).toUpperCase() + modeLabel.slice(1)} check complete.`);
     return;
+=======
+  if (PENDING_MODE) {
+    log(`[*] Checking pending rewards for ${accounts.length} accounts...`);
+    await checkPending(accounts);
+    log(`[*] Pending reward check complete.`);
+    return;
+  }
+
+  log(`[*] Checking ${accounts.length} accounts one at a time...`);
+
+  for (const acc of accounts) {
+    await checkAccount(supabase, acc);
+>>>>>>> d9e7a2c (Add files via upload)
   }
 
   const targets = applyFilter(accounts);
