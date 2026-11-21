@@ -362,6 +362,7 @@ async function checkPending(accounts) {
   const reasons = new Map();
   let errors = 0;
   let totalClaimed = 0;
+  let totalClaimedAmount = 0;
   let totalClaimFailed = 0;
   const claimReasons = new Map();
 
@@ -394,16 +395,20 @@ async function checkPending(accounts) {
         const result = { address: acc.address, records: list, ...classified };
         results.push(result);
 
-        const hasRewards = result.ready.length || result.pending.length;
-        if (hasRewards) {
-          const claiming = CLAIM_MODE && result.ready.length;
-          log(`[${acc.address}] ${describeRewards(result)}${claiming ? ' | claiming...' : ''}`);
+        if (CLAIM_MODE) {
+          // --claim: claim logs only (pending rewards are not mentioned)
+          if (result.ready.length) {
+            log(`[${acc.address}] claiming ${fmtAmount(sum(result.ready))} (${result.ready.length} reward${result.ready.length > 1 ? 's' : ''})...`);
+          }
+        } else if (result.ready.length || result.pending.length) {
+          log(`[${acc.address}] ${describeRewards(result)}`);
         }
 
         if (CLAIM_MODE && result.ready.length) {
           const claim = await claimAllReady(acc, result.ready);
           result.claim = claim;
           totalClaimed += claim.claimed;
+          totalClaimedAmount += claim.claimedAmount;
           totalClaimFailed += claim.failed;
           for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
 
@@ -424,6 +429,23 @@ async function checkPending(accounts) {
 
   const withRewards = results.filter(x => x.ready.length || x.pending.length);
 
+  const none = results.length - withRewards.length;
+  const errorText = `${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`;
+
+  if (CLAIM_MODE) {
+    // --claim summary: claims only
+    const claimSummary = [
+      `claimed ${totalClaimed} reward${totalClaimed === 1 ? '' : 's'} (${fmtAmount(totalClaimedAmount)}) in ${results.filter(x => x.claim && x.claim.claimed).length} accounts`,
+    ];
+    if (totalClaimFailed) claimSummary.push(`${totalClaimFailed} failed (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
+    const nothingReady = results.filter(x => !x.ready.length).length;
+    if (nothingReady) claimSummary.push(`${nothingReady} with nothing ready to claim`);
+    if (errors) claimSummary.push(errorText);
+    if (skipped) claimSummary.push(`${skipped} without credentials`);
+    log(`[*] Claim complete: ${claimSummary.join(' | ')}.`);
+    return;
+  }
+
   const allReady = results.flatMap(x => x.ready);
   const allPending = results.flatMap(x => x.pending);
   const summary = [
@@ -431,14 +453,9 @@ async function checkPending(accounts) {
     `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts (${allPending.length} rewards)`,
   ];
   if (allPending.length) summary.push(`next unlock in ${fmtLeft(allPending.reduce((m, p) => Math.min(m, p.left), Infinity))}`);
-  const none = results.length - withRewards.length;
   if (none) summary.push(`${none} with nothing to claim`);
-  if (errors) summary.push(`${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
+  if (errors) summary.push(errorText);
   if (skipped) summary.push(`${skipped} without credentials`);
-
-  if (CLAIM_MODE) {
-    summary.push(`claimed ${totalClaimed}, failed ${totalClaimFailed}${totalClaimFailed ? ` (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})` : ''}`);
-  }
 
   log(`[*] Pending rewards: ${summary.join(' | ')}.`);
 }
