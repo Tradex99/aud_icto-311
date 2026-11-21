@@ -114,11 +114,10 @@ for (const level of ['log', 'info', 'debug', 'warn']) {
 }
 
 process.on('unhandledRejection', (reason) => {
-  const msg = reason && reason.message ? reason.message : String(reason);
-  log(`[!] Unhandled rejection (likely SDK background task): ${msg}`);
+  log(`[!] Background error: ${describeError(reason)}`);
 });
 process.on('uncaughtException', (err) => {
-  log(`[!] Uncaught exception (likely SDK background task): ${err.message || err}`);
+  log(`[!] Background error: ${describeError(err)}`);
 });
 
 const ROOT_DIR = path.resolve(__dirname, '..');
@@ -143,6 +142,21 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function getStatus(e) {
   return e?.status ?? e?.response?.status ?? e?.cause?.status ?? null;
+}
+
+const STATUS_NAMES = {
+  400: 'bad request', 401: 'unauthorized', 403: 'forbidden', 404: 'not found', 408: 'request timeout',
+  409: 'conflict', 422: 'unprocessable', 429: 'rate limited',
+};
+
+// Short, human-readable error: the HTTP status code and its name, never the API response body.
+function describeError(e) {
+  const status = getStatus(e);
+  if (status) return `HTTP ${status} ${STATUS_NAMES[status] || (status >= 500 ? 'server error' : status >= 400 ? 'client error' : 'unexpected status')}`;
+  const msg = String((e && e.message) || e).replace(/\s+/g, ' ');
+  if (/abort|timeout|timed out/i.test(msg)) return 'timed out';
+  if (/fetch failed|network|ECONN|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|socket/i.test(msg)) return 'network error';
+  return msg.slice(0, 40);
 }
 
 async function withRetry(fn) {
@@ -240,7 +254,7 @@ async function fetchUndisbursed(appData, userId) {
       items = await withRetry(() => fetchUndisbursedPage(appData, userId, offset, PAGE_SIZE));
     } catch (e) {
       if (page === 0) throw e;
-      if (DEBUG) log(`  [debug] user ${userId} page ${page + 1} (offset ${offset}) failed: ${e.message}`);
+      if (DEBUG) log(`  [debug] user ${userId} page ${page + 1} (offset ${offset}) failed: ${describeError(e)}`);
       break;
     }
     if (DEBUG) log(`  [debug] user ${userId} page ${page + 1} (offset ${offset}): ${items.length} record(s)`);
@@ -296,12 +310,11 @@ async function claimReward(appData, userId, challengeId, specifier) {
     const text = await res.text();
     let json;
     try { json = JSON.parse(text); } catch { json = { raw: text }; }
-    
+
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}`);
       err.status = res.status;
-      err.body = json;
-      err.payload = body;
+      if (DEBUG) err.responseText = text.replace(/\s+/g, ' ').slice(0, 150);
       throw err;
     }
     return json;
@@ -311,45 +324,29 @@ async function claimReward(appData, userId, challengeId, specifier) {
 }
 
 async function claimAllReady(acc, readyList) {
-  if (!readyList.length) return { claimed: 0, failed: 0, errors: [] };
-  const results = { claimed: 0, failed: 0, errors: [] };
-  
+  const results = { claimed: 0, failed: 0, reasons: new Map() };
+  const fail = (why) => { results.failed++; results.reasons.set(why, (results.reasons.get(why) || 0) + 1); };
+
   for (const item of readyList) {
     const r = item.raw;
     const challengeId = pickField(r, 'challenge_id', 'challengeId', 'id') || null;
     const specifier = pickField(r, 'specifier', 'spec') || null;
 
     if (!challengeId || !specifier) {
-      results.failed++;
-      const idText = challengeId ? `challenge=${challengeId}` : 'challenge=MISSING';
-      const specText = specifier ? `specifier=${specifier}` : 'specifier=MISSING';
-      results.errors.push(`${idText} ${specText}: missing required field`);
-      if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${idText} ${specText} skipped`);
+      fail('missing challenge data');
+      if (VERBOSE) log(`  [claim] ${acc.address} ✗ missing challenge data`);
       continue;
     }
 
     try {
       await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
       results.claimed++;
-      if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${specifier} ${fmtAmount(item.amount)}`);
+      if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
     } catch (e) {
-      results.failed++;
-      const status = getStatus(e);
-      let why = status ? `HTTP ${status}` : String(e.message || e).slice(0, 60);
-      
-      let apiResponse = '';
-      if (e.body) {
-        apiResponse = typeof e.body === 'string' ? e.body : JSON.stringify(e.body);
-      }
-      const payloadStr = e.payload ? JSON.stringify(e.payload) : 'unknown';
-
-      results.errors.push(`${challengeId} ${specifier}: ${why} | API Response: ${apiResponse} | Payload: ${payloadStr}`);
-      
-      if (VERBOSE) {
-        log(`  [claim] ${acc.address} ✗ ${challengeId} ${specifier}: ${why}`);
-        log(`          ↳ API Response: ${apiResponse}`);
-        log(`          ↳ Payload: ${payloadStr}`);
-      }
+      const why = describeError(e);
+      fail(why);
+      if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
+      if (DEBUG && e.responseText) log(`          response: ${e.responseText}`);
     }
   }
   return results;
@@ -365,7 +362,7 @@ async function checkPending(accounts) {
   let errors = 0;
   let totalClaimed = 0;
   let totalClaimFailed = 0;
-  const claimErrors = [];
+  const claimReasons = new Map();
 
   if (ONLY_ADDRESS) log(`[*] Filtered to ${queue.length} account(s) matching --address=${ONLY_ADDRESS}.`);
   if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
@@ -383,14 +380,13 @@ async function checkPending(accounts) {
           result.claim = claim;
           totalClaimed += claim.claimed;
           totalClaimFailed += claim.failed;
-          for (const err of claim.errors) claimErrors.push(`${acc.address}: ${err}`);
+          for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
         }
 
         results.push(result);
       } catch (e) {
         errors++;
-        const status = getStatus(e);
-        const why = status ? `HTTP ${status}` : String(e.message || e).slice(0, 40);
+        const why = describeError(e);
         reasons.set(why, (reasons.get(why) || 0) + 1);
       }
     }
@@ -416,12 +412,12 @@ async function checkPending(accounts) {
     } else if (x.pending.length) {
       parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
     }
-    log(`[${x.address}] ${parts.join(' | ')}`);
-
     if (CLAIM_MODE && x.claim) {
       const c = x.claim;
-      log(`  [claim] ${c.claimed} claimed, ${c.failed} failed`);
+      if (c.claimed) parts.push(`claimed ${c.claimed}`);
+      if (c.failed) parts.push(`${c.failed} failed (${[...c.reasons.keys()].join(', ')})`);
     }
+    log(`[${x.address}] ${parts.join(' | ')}`);
   }
 
   const allReady = results.flatMap(x => x.ready);
@@ -437,16 +433,10 @@ async function checkPending(accounts) {
   if (skipped) summary.push(`${skipped} without credentials`);
 
   if (CLAIM_MODE) {
-    summary.push(`claimed ${totalClaimed} reward(s), ${totalClaimFailed} failed`);
+    summary.push(`claimed ${totalClaimed}, failed ${totalClaimFailed}${totalClaimFailed ? ` (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})` : ''}`);
   }
 
   log(`[*] Pending rewards: ${summary.join(' | ')}.`);
-
-  if (CLAIM_MODE && claimErrors.length) {
-    log(`[!] Claim errors:`);
-    for (const err of claimErrors.slice(0, 20)) log(`  - ${err}`);
-    if (claimErrors.length > 20) log(`  ... and ${claimErrors.length - 20} more`);
-  }
 }
 
 async function checkAccount(supabase, account) {
@@ -473,6 +463,8 @@ async function checkAccount(supabase, account) {
     let coinBalanceUsd = 0.0;
     let historyCount = 0;
     let historyFailed = false;
+    const issues = [];
+    let historyIssue = '';
 
     try {
       const userRes = await withRetry(() => sdk.users.getUser({ id: userId }));
@@ -484,7 +476,7 @@ async function checkAccount(supabase, account) {
         waudioBalance = user.waudioBalance ?? null;
       }
     } catch (e) {
-      log(`[${address}] Profile fetch failed (status=${getStatus(e) ?? 'unknown'}): ${e.message || e}`);
+      issues.push(`profile fetch failed: ${describeError(e)}`);
     }
 
     try {
@@ -509,7 +501,7 @@ async function checkAccount(supabase, account) {
         }
       }
     } catch (e) {
-      log(`[${address}] Coin fetch failed (status=${getStatus(e) ?? 'unknown'}): ${e.message || e}`);
+      issues.push(`coin fetch failed: ${describeError(e)}`);
     }
 
     try {
@@ -524,7 +516,7 @@ async function checkAccount(supabase, account) {
         historyCount = 0;
       } else {
         historyFailed = true;
-        log(`[${address}] History fetch failed (status=${status ?? 'unknown'}): ${e.message || e}`);
+        historyIssue = describeError(e);
       }
     }
 
@@ -535,7 +527,9 @@ async function checkAccount(supabase, account) {
     if (waudioBalance !== null) logs.push(`WAudio: ${waudioBalance}`);
     if (coinBalance > 0) logs.push(`$AUDIO Coin: ${coinBalance} ($${coinBalanceUsd})`);
     if (historyCount > 0) logs.push(`History: ${historyCount} items`);
-    else if (historyFailed) logs.push(`History: fetch failed (not confirmed empty)`);
+    else if (historyFailed) logs.push(`History: fetch failed, ${historyIssue}`);
+
+    logs.push(...issues);
 
     const updates = {};
     const resolvedBalance = totalAudioBalance !== null ? totalAudioBalance : (coinBalance > 0 ? coinBalance : null);
@@ -547,16 +541,16 @@ async function checkAccount(supabase, account) {
     if (Object.keys(updates).length > 0) {
       try {
         const { error } = await supabase.from('audius').update(updates).eq('address', address);
-        if (error) logs.push(`DB update failed: ${error.message}`);
+        if (error) logs.push('DB update failed');
       } catch (e) {
-        logs.push(`DB update failed: ${e.message}`);
+        logs.push('DB update failed');
       }
     }
 
     if (logs.length > 0) log(`[${address}] ${logs.join(' | ')}`);
 
   } catch (err) {
-    log(`[${address}] Error: ${err.message || err}`);
+    log(`[${address}] failed: ${describeError(err)}`);
   }
 }
 
@@ -584,7 +578,7 @@ async function main() {
     .not('user_id', 'is', null);
 
   if (error) {
-    console.error(`[!] Failed to fetch accounts:`, error);
+    console.error(`[!] Failed to fetch accounts: ${error.message || error}`);
     process.exit(1);
   }
 
@@ -609,6 +603,6 @@ async function main() {
 }
 
 main().catch(err => {
-  console.error(`[!] Fatal:`, err);
+  console.error(`[!] Fatal: ${describeError(err)}`);
   process.exit(1);
 });
