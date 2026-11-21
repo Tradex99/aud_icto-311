@@ -324,7 +324,7 @@ async function claimReward(appData, userId, challengeId, specifier) {
 }
 
 async function claimAllReady(acc, readyList) {
-  const results = { claimed: 0, failed: 0, reasons: new Map() };
+  const results = { claimed: 0, claimedAmount: 0, failed: 0, reasons: new Map() };
   const fail = (why) => { results.failed++; results.reasons.set(why, (results.reasons.get(why) || 0) + 1); };
 
   for (const item of readyList) {
@@ -341,6 +341,7 @@ async function claimAllReady(acc, readyList) {
     try {
       await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
       results.claimed++;
+      results.claimedAmount += item.amount;
       if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
     } catch (e) {
       const why = describeError(e);
@@ -367,42 +368,10 @@ async function checkPending(accounts) {
   if (ONLY_ADDRESS) log(`[*] Filtered to ${queue.length} account(s) matching --address=${ONLY_ADDRESS}.`);
   if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
 
-  const worker = async () => {
-    while (queue.length) {
-      const acc = queue.shift();
-      try {
-        const list = await withRetry(() => fetchUndisbursed(acc.app_data, acc.user_id));
-        const classified = classifyRewards(list, now);
-        const result = { address: acc.address, records: list, ...classified };
-
-        if (CLAIM_MODE && result.ready.length) {
-          const claim = await claimAllReady(acc, result.ready);
-          result.claim = claim;
-          totalClaimed += claim.claimed;
-          totalClaimFailed += claim.failed;
-          for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
-        }
-
-        results.push(result);
-      } catch (e) {
-        errors++;
-        const why = describeError(e);
-        reasons.set(why, (reasons.get(why) || 0) + 1);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, worker));
-
   const sum = (list) => list.reduce((n, x) => n + x.amount, 0);
-  const withRewards = results.filter(x => x.ready.length || x.pending.length);
-  withRewards.sort((a, b) => sum(b.ready) - sum(a.ready) ||
-    (a.pending[0] ? a.pending[0].left : Infinity) - (b.pending[0] ? b.pending[0].left : Infinity));
 
-  for (const x of withRewards) {
-    if (!x.ready.length && !(CLAIM_MODE && x.claim && x.claim.failed)) {
-      continue;
-    }
-
+  // "ready to claim 1000 $AUDIO (2 rewards) | pending 200 $AUDIO (100 in 19h, 100 in 5d 3h)"
+  const describeRewards = (x) => {
     const parts = [];
     if (x.ready.length) {
       parts.push(`ready to claim ${fmtAmount(sum(x.ready))} (${x.ready.length} reward${x.ready.length > 1 ? 's' : ''})`);
@@ -412,13 +381,48 @@ async function checkPending(accounts) {
     } else if (x.pending.length) {
       parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
     }
-    if (CLAIM_MODE && x.claim) {
-      const c = x.claim;
-      if (c.claimed) parts.push(`claimed ${c.claimed}`);
-      if (c.failed) parts.push(`${c.failed} failed (${[...c.reasons.keys()].join(', ')})`);
+    return parts.join(' | ');
+  };
+
+  // Every account is reported the moment its check (and claim) finishes, not after all of them.
+  const worker = async () => {
+    while (queue.length) {
+      const acc = queue.shift();
+      try {
+        const list = await withRetry(() => fetchUndisbursed(acc.app_data, acc.user_id));
+        const classified = classifyRewards(list, now);
+        const result = { address: acc.address, records: list, ...classified };
+        results.push(result);
+
+        const hasRewards = result.ready.length || result.pending.length;
+        if (hasRewards) {
+          const claiming = CLAIM_MODE && result.ready.length;
+          log(`[${acc.address}] ${describeRewards(result)}${claiming ? ' | claiming...' : ''}`);
+        }
+
+        if (CLAIM_MODE && result.ready.length) {
+          const claim = await claimAllReady(acc, result.ready);
+          result.claim = claim;
+          totalClaimed += claim.claimed;
+          totalClaimFailed += claim.failed;
+          for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
+
+          const done = [`claimed ${claim.claimed}/${result.ready.length} reward${result.ready.length > 1 ? 's' : ''}`];
+          if (claim.claimed) done[0] += ` (${fmtAmount(claim.claimedAmount)})`;
+          if (claim.failed) done.push(`${claim.failed} failed (${[...claim.reasons.keys()].join(', ')})`);
+          log(`[${acc.address}] ${done.join(' | ')}`);
+        }
+      } catch (e) {
+        errors++;
+        const why = describeError(e);
+        reasons.set(why, (reasons.get(why) || 0) + 1);
+        log(`[!] [${acc.address}] check failed: ${why}`);
+      }
     }
-    log(`[${x.address}] ${parts.join(' | ')}`);
-  }
+  };
+  await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, worker));
+
+  const withRewards = results.filter(x => x.ready.length || x.pending.length);
 
   const allReady = results.flatMap(x => x.ready);
   const allPending = results.flatMap(x => x.pending);
