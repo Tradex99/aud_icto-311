@@ -43,7 +43,6 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
     
-    // Only proxy Audius API calls
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
 
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
@@ -149,7 +148,6 @@ const STATUS_NAMES = {
   409: 'conflict', 422: 'unprocessable', 429: 'rate limited',
 };
 
-// Short, human-readable error: the HTTP status code and its name, never the API response body.
 function describeError(e) {
   const status = getStatus(e);
   if (status) return `HTTP ${status} ${STATUS_NAMES[status] || (status >= 500 ? 'server error' : status >= 400 ? 'client error' : 'unexpected status')}`;
@@ -314,10 +312,10 @@ async function claimReward(appData, userId, challengeId, specifier) {
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}`);
       err.status = res.status;
-      if (DEBUG) err.responseText = text.replace(/\s+/g, ' ').slice(0, 150);
+      err.responseText = text;
       throw err;
     }
-    return json;
+    return { json, text, status: res.status };
   } finally {
     clearTimeout(timer);
   }
@@ -339,15 +337,32 @@ async function claimAllReady(acc, readyList) {
     }
 
     try {
-      await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
+      const result = await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
+      const json = result.json;
+
+      // Check for hidden soft failures inside a 2xx response
+      if (json && (json.success === false || json.error)) {
+        const err = new Error('soft failure');
+        err.responseText = result.text;
+        throw err;
+      }
+
       results.claimed++;
       results.claimedAmount += item.amount;
+      
+      // Log full response for 2xx status codes
+      log(`  [api-2xx] ${acc.address} ${challengeId} ${specifier} -> HTTP ${result.status} | Response: ${result.text}`);
+      
       if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
     } catch (e) {
       const why = describeError(e);
       fail(why);
       if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
-      if (DEBUG && e.responseText) log(`          response: ${e.responseText}`);
+      
+      // Log response body for unexpected statuses (skip 400 and 500 which are known giant Solana errors)
+      if (e.responseText && e.status !== 400 && e.status !== 500) {
+        log(`          response: ${e.responseText.slice(0, 500)}`);
+      }
     }
   }
   return results;
@@ -371,7 +386,6 @@ async function checkPending(accounts) {
 
   const sum = (list) => list.reduce((n, x) => n + x.amount, 0);
 
-  // "ready to claim 1000 $AUDIO (2 rewards) | pending 200 $AUDIO (100 in 19h, 100 in 5d 3h)"
   const describeRewards = (x) => {
     const parts = [];
     if (x.ready.length) {
@@ -385,7 +399,6 @@ async function checkPending(accounts) {
     return parts.join(' | ');
   };
 
-  // Every account is reported the moment its check (and claim) finishes, not after all of them.
   const worker = async () => {
     while (queue.length) {
       const acc = queue.shift();
@@ -396,7 +409,6 @@ async function checkPending(accounts) {
         results.push(result);
 
         if (CLAIM_MODE) {
-          // --claim: claim logs only (pending rewards are not mentioned)
           if (result.ready.length) {
             log(`[${acc.address}] claiming ${fmtAmount(sum(result.ready))} (${result.ready.length} reward${result.ready.length > 1 ? 's' : ''})...`);
           }
@@ -428,12 +440,10 @@ async function checkPending(accounts) {
   await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, worker));
 
   const withRewards = results.filter(x => x.ready.length || x.pending.length);
-
   const none = results.length - withRewards.length;
   const errorText = `${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`;
 
   if (CLAIM_MODE) {
-    // --claim summary: claims only
     const claimSummary = [
       `claimed ${totalClaimed} reward${totalClaimed === 1 ? '' : 's'} (${fmtAmount(totalClaimedAmount)}) in ${results.filter(x => x.claim && x.claim.claimed).length} accounts`,
     ];
