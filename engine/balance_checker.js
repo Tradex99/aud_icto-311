@@ -137,10 +137,6 @@ const BASE_DELAY_MS = 1000;
 const PAGE_SIZE = Number(process.env.UNDISBURSED_PAGE_SIZE || 100);
 const MAX_PAGES = Number(process.env.UNDISBURSED_MAX_PAGES || 20);
 
-// --- Loop Configuration ---
-const MAX_CLAIM_LOOPS = Number(process.env.MAX_CLAIM_LOOPS || 100);
-const CLAIM_LOOP_DELAY_MS = Number(process.env.CLAIM_LOOP_DELAY_SECONDS || 5) * 1000;
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function getStatus(e) {
@@ -195,6 +191,81 @@ function pickField(obj, ...names) {
     if (obj[name] !== undefined && obj[name] !== null) return obj[name];
   }
   return undefined;
+}
+
+// --- Solana Base58 Encoder (for fee payer address) ---
+const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function base58Encode(buffer) {
+  const digits = [0];
+  for (let i = 0; i < buffer.length; i++) {
+    let carry = buffer[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let string = '';
+  for (let i = 0; i < buffer.length && buffer[i] === 0; i++) {
+    string += ALPHABET[0];
+  }
+  for (let i = digits.length - 1; i >= 0; i--) {
+    string += ALPHABET[digits[i]];
+  }
+  return string;
+}
+
+// --- ShortVec Reader ---
+function readShortVec(buffer, offset) {
+  let len = 0;
+  let size = 0;
+  while (true) {
+    if (offset + size >= buffer.length) return null;
+    const elem = buffer[offset + size];
+    len |= (elem & 0x7f) << (size * 7);
+    size += 1;
+    if ((elem & 0x80) === 0) break;
+  }
+  return { len, size };
+}
+
+// --- Parse Solana Error Response ---
+function parseSolanaTxError(responseText) {
+  try {
+    const json = JSON.parse(responseText);
+    if (!json.error || typeof json.error !== 'string') return null;
+
+    const lamportsMatch = json.error.match(/insufficient lamports (\d+)/i);
+    const lamports = lamportsMatch ? parseInt(lamportsMatch[1], 10) : 0;
+
+    const txMatch = json.error.match(/transaction: ([A-Za-z0-9+/=]+)/i);
+    if (!txMatch) return null;
+
+    const txBuffer = Buffer.from(txMatch[1], 'base64');
+
+    // Solana transaction format:
+    // [shortvec signatures] [message header (3 bytes)] [shortvec account keys] [account keys...]
+    const sigInfo = readShortVec(txBuffer, 0);
+    if (!sigInfo) return null;
+
+    const msgStart = sigInfo.size + (sigInfo.len * 64);
+    const keysInfo = readShortVec(txBuffer, msgStart + 3);
+    if (!keysInfo) return null;
+
+    const feePayerOffset = msgStart + 3 + keysInfo.size;
+    const feePayerBytes = txBuffer.subarray(feePayerOffset, feePayerOffset + 32);
+
+    if (feePayerBytes.length < 32) return null;
+    const feePayer = base58Encode(feePayerBytes);
+
+    return { feePayer, lamports };
+  } catch (e) {
+    return null;
+  }
 }
 
 const AMOUNT_DECIMALS = Number(process.env.AMOUNT_DECIMALS || 0);
@@ -326,15 +397,11 @@ async function claimReward(appData, userId, challengeId, specifier) {
 }
 
 async function claimAllReady(acc, readyList) {
-  const results = { claimed: 0, claimedAmount: 0, fatalFailed: 0, reasons: new Map(), retryItems: [] };
+  const results = { claimed: 0, claimedAmount: 0, fatalFailed: 0, reasons: new Map(), solanaErrors: [] };
   
-  const fail = (why, isRetryable, item) => {
+  const fail = (why) => {
     results.reasons.set(why, (results.reasons.get(why) || 0) + 1);
-    if (isRetryable) {
-      if (item) results.retryItems.push(item);
-    } else {
-      results.fatalFailed++;
-    }
+    results.fatalFailed++;
   };
 
   for (const item of readyList) {
@@ -343,7 +410,7 @@ async function claimAllReady(acc, readyList) {
     const specifier = pickField(r, 'specifier', 'spec') || null;
 
     if (!challengeId || !specifier) {
-      fail('missing challenge data', false);
+      fail('missing challenge data');
       if (VERBOSE) log(`  [claim] ${acc.address} ✗ missing challenge data`);
       continue;
     }
@@ -352,7 +419,6 @@ async function claimAllReady(acc, readyList) {
       const result = await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
       const json = result.json;
 
-      // Check for hidden soft failures inside a 2xx response
       if (json && (json.success === false || json.error)) {
         const isRetryable = /try again|busy|timeout/i.test(JSON.stringify(json));
         const err = new Error('soft failure');
@@ -364,21 +430,26 @@ async function claimAllReady(acc, readyList) {
       results.claimed++;
       results.claimedAmount += item.amount;
       
-      // Log full response for 2xx status codes
       log(`  [api-2xx] ${acc.address} ${challengeId} ${specifier} -> HTTP ${result.status} | Response: ${result.text}`);
       
       if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
     } catch (e) {
       const status = getStatus(e);
-      const isRetryable = status >= 500 || status === null;
       const why = describeError(e);
-      fail(why, isRetryable, item);
+      fail(why);
       
       if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
       
-      // Log response body for unexpected statuses (skip 400 and 500 which are known giant Solana errors)
       if (e.responseText && status !== 400 && status !== 500) {
         log(`          response: ${e.responseText.slice(0, 500)}`);
+      }
+
+      // Extract Solana details on 500 errors
+      if (status === 500 && e.responseText) {
+        const solInfo = parseSolanaTxError(e.responseText);
+        if (solInfo) {
+          results.solanaErrors.push({ address: acc.address, ...solInfo });
+        }
       }
     }
   }
@@ -460,79 +531,60 @@ async function checkPending(accounts) {
     return;
   }
 
-  // Phase 2: Claim Loop
-  let pass = 1;
-  let currentQueue = accountsWithReady;
+  // Phase 2: Claim (Single Pass)
   let totalClaimed = 0;
   let totalClaimedAmount = 0;
   let totalFatalFailed = 0;
-  let totalRetryFailed = 0;
   let accountsWithSuccessfulClaims = 0;
   const claimReasons = new Map();
 
-  while (currentQueue.length > 0 && pass <= MAX_CLAIM_LOOPS) {
-    if (pass > 1) {
-      const itemsCount = currentQueue.reduce((n, x) => n + x.readyList.length, 0);
-      log(`[*] Claim pass ${pass}/${MAX_CLAIM_LOOPS}: retrying ${itemsCount} rewards in ${currentQueue.length} accounts (HTTP 500)...`);
-      await sleep(CLAIM_LOOP_DELAY_MS);
-    }
+  // Aggregator for Solana Fee Payers
+  const payerStats = new Map();
 
-    const nextQueue = [];
-    const claimQueue = [...currentQueue];
+  const claimQueue = [...accountsWithReady];
 
-    const claimWorker = async () => {
-      while (claimQueue.length) {
-        const { acc, readyList } = claimQueue.shift();
-        
-        if (pass === 1) {
-          log(`[${acc.address}] claiming ${fmtAmount(sum(readyList))} (${readyList.length} reward${readyList.length > 1 ? 's' : ''})...`);
-        } else {
-          log(`[${acc.address}] retrying claim for ${fmtAmount(sum(readyList))} (${readyList.length} reward${readyList.length > 1 ? 's' : ''})...`);
-        }
+  const claimWorker = async () => {
+    while (claimQueue.length) {
+      const { acc, readyList } = claimQueue.shift();
+      
+      log(`[${acc.address}] claiming ${fmtAmount(sum(readyList))} (${readyList.length} reward${readyList.length > 1 ? 's' : ''})...`);
 
-        const claim = await claimAllReady(acc, readyList);
-        totalClaimed += claim.claimed;
-        totalClaimedAmount += claim.claimedAmount;
-        totalFatalFailed += claim.fatalFailed;
-        if (claim.claimed > 0) accountsWithSuccessfulClaims++;
-        
-        for (const [why, n] of claim.reasons) {
-          claimReasons.set(why, (claimReasons.get(why) || 0) + n);
-        }
+      const claim = await claimAllReady(acc, readyList);
+      totalClaimed += claim.claimed;
+      totalClaimedAmount += claim.claimedAmount;
+      totalFatalFailed += claim.fatalFailed;
+      if (claim.claimed > 0) accountsWithSuccessfulClaims++;
+      
+      for (const [why, n] of claim.reasons) {
+        claimReasons.set(why, (claimReasons.get(why) || 0) + n);
+      }
 
-        const done = [];
-        if (claim.claimed) done.push(`claimed ${claim.claimed} (${fmtAmount(claim.claimedAmount)})`);
-        if (claim.fatalFailed) done.push(`${claim.fatalFailed} fatal fails`);
-        if (claim.retryItems.length) done.push(`${claim.retryItems.length} queued for retry (500)`);
-        
-        if (done.length) log(`[${acc.address}] ${done.join(' | ')}`);
-
-        if (claim.retryItems.length > 0) {
-          nextQueue.push({ acc, readyList: claim.retryItems });
+      // Aggregate Solana errors
+      if (claim.solanaErrors && claim.solanaErrors.length) {
+        for (const err of claim.solanaErrors) {
+          if (!payerStats.has(err.feePayer)) payerStats.set(err.feePayer, { lamports: 0, accounts: new Set() });
+          const stat = payerStats.get(err.feePayer);
+          stat.lamports += err.lamports;
+          stat.accounts.add(err.address);
         }
       }
-    };
 
-    await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, claimWorker));
+      const done = [];
+      if (claim.claimed) done.push(`claimed ${claim.claimed} (${fmtAmount(claim.claimedAmount)})`);
+      if (claim.fatalFailed) done.push(`${claim.fatalFailed} fails`);
+      
+      if (done.length) log(`[${acc.address}] ${done.join(' | ')}`);
+    }
+  };
 
-    currentQueue = nextQueue;
-    pass++;
-  }
-
-  if (currentQueue.length > 0) {
-    const remaining = currentQueue.reduce((n, x) => n + x.readyList.length, 0);
-    totalRetryFailed = remaining;
-    log(`[!] Reached max loops (${MAX_CLAIM_LOOPS}). ${remaining} rewards in ${currentQueue.length} accounts failed with HTTP 500.`);
-    claimReasons.set('HTTP 500 server error (max loops reached)', remaining);
-  }
+  await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, claimWorker));
 
   // Claim Summary
-  const finalFailed = totalFatalFailed + totalRetryFailed;
   const claimSummaryStr = [
     `claimed ${totalClaimed} reward${totalClaimed === 1 ? '' : 's'} (${fmtAmount(totalClaimedAmount)}) in ${accountsWithSuccessfulClaims} accounts`
   ];
   
-  if (finalFailed) claimSummaryStr.push(`${finalFailed} failed (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
+  if (totalFatalFailed) claimSummaryStr.push(`${totalFatalFailed} failed (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
   
   const accountsWithZeroReady = results.filter(x => !x.ready.length).length;
   if (accountsWithZeroReady) claimSummaryStr.push(`${accountsWithZeroReady} with nothing ready to claim`);
@@ -540,6 +592,27 @@ async function checkPending(accounts) {
   if (skipped) claimSummaryStr.push(`${skipped} without credentials`);
   
   log(`[*] Claim complete: ${claimSummaryStr.join(' | ')}.`);
+
+  // --- Solana Fee Payer Summary ---
+  if (payerStats.size > 0) {
+    log(`\n[!] --- Solana Fee Payer Analysis ---`);
+    if (payerStats.size === 1) {
+      const [payer, stat] = [...payerStats.entries()][0];
+      log(`[!] All failed accounts use 1 payer address: ${payer}`);
+      log(`[!] Accounts: ${stat.accounts.size}`);
+      log(`[!] Total Lamports needed: ${stat.lamports} (approx ${(stat.lamports / 1e9).toFixed(4)} SOL)`);
+    } else {
+      log(`[!] Found ${payerStats.size} distinct payer addresses:`);
+      for (const [payer, stat] of payerStats.entries()) {
+        log(`    - Payer: ${payer}`);
+        log(`      Accounts: ${stat.accounts.size}`);
+        log(`      Total Lamports: ${stat.lamports}`);
+      }
+      const grandTotal = [...payerStats.values()].reduce((sum, s) => sum + s.lamports, 0);
+      log(`[!] Grand Total Lamports needed: ${grandTotal} (approx ${(grandTotal / 1e9).toFixed(4)} SOL)`);
+    }
+    log(`[!] ---------------------------------\n`);
+  }
 }
 
 async function checkAccount(supabase, account) {
