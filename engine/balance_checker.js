@@ -137,6 +137,10 @@ const BASE_DELAY_MS = 1000;
 const PAGE_SIZE = Number(process.env.UNDISBURSED_PAGE_SIZE || 100);
 const MAX_PAGES = Number(process.env.UNDISBURSED_MAX_PAGES || 20);
 
+// --- Loop Configuration ---
+const MAX_CLAIM_LOOPS = Number(process.env.MAX_CLAIM_LOOPS || 100);
+const CLAIM_LOOP_DELAY_MS = Number(process.env.CLAIM_LOOP_DELAY_SECONDS || 5) * 1000;
+
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function getStatus(e) {
@@ -322,8 +326,16 @@ async function claimReward(appData, userId, challengeId, specifier) {
 }
 
 async function claimAllReady(acc, readyList) {
-  const results = { claimed: 0, claimedAmount: 0, failed: 0, reasons: new Map() };
-  const fail = (why) => { results.failed++; results.reasons.set(why, (results.reasons.get(why) || 0) + 1); };
+  const results = { claimed: 0, claimedAmount: 0, fatalFailed: 0, reasons: new Map(), retryItems: [] };
+  
+  const fail = (why, isRetryable, item) => {
+    results.reasons.set(why, (results.reasons.get(why) || 0) + 1);
+    if (isRetryable) {
+      if (item) results.retryItems.push(item);
+    } else {
+      results.fatalFailed++;
+    }
+  };
 
   for (const item of readyList) {
     const r = item.raw;
@@ -331,7 +343,7 @@ async function claimAllReady(acc, readyList) {
     const specifier = pickField(r, 'specifier', 'spec') || null;
 
     if (!challengeId || !specifier) {
-      fail('missing challenge data');
+      fail('missing challenge data', false);
       if (VERBOSE) log(`  [claim] ${acc.address} ✗ missing challenge data`);
       continue;
     }
@@ -342,7 +354,9 @@ async function claimAllReady(acc, readyList) {
 
       // Check for hidden soft failures inside a 2xx response
       if (json && (json.success === false || json.error)) {
+        const isRetryable = /try again|busy|timeout/i.test(JSON.stringify(json));
         const err = new Error('soft failure');
+        err.status = isRetryable ? 500 : 400;
         err.responseText = result.text;
         throw err;
       }
@@ -355,12 +369,15 @@ async function claimAllReady(acc, readyList) {
       
       if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
     } catch (e) {
+      const status = getStatus(e);
+      const isRetryable = status >= 500 || status === null;
       const why = describeError(e);
-      fail(why);
+      fail(why, isRetryable, item);
+      
       if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
       
       // Log response body for unexpected statuses (skip 400 and 500 which are known giant Solana errors)
-      if (e.responseText && e.status !== 400 && e.status !== 500) {
+      if (e.responseText && status !== 400 && status !== 500) {
         log(`          response: ${e.responseText.slice(0, 500)}`);
       }
     }
@@ -376,10 +393,6 @@ async function checkPending(accounts) {
   const results = [];
   const reasons = new Map();
   let errors = 0;
-  let totalClaimed = 0;
-  let totalClaimedAmount = 0;
-  let totalClaimFailed = 0;
-  const claimReasons = new Map();
 
   if (ONLY_ADDRESS) log(`[*] Filtered to ${queue.length} account(s) matching --address=${ONLY_ADDRESS}.`);
   if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
@@ -399,6 +412,9 @@ async function checkPending(accounts) {
     return parts.join(' | ');
   };
 
+  let accountsWithReady = [];
+
+  // Phase 1: Fetch all rewards
   const worker = async () => {
     while (queue.length) {
       const acc = queue.shift();
@@ -408,26 +424,12 @@ async function checkPending(accounts) {
         const result = { address: acc.address, records: list, ...classified };
         results.push(result);
 
-        if (CLAIM_MODE) {
-          if (result.ready.length) {
-            log(`[${acc.address}] claiming ${fmtAmount(sum(result.ready))} (${result.ready.length} reward${result.ready.length > 1 ? 's' : ''})...`);
-          }
-        } else if (result.ready.length || result.pending.length) {
+        if (!CLAIM_MODE && (result.ready.length || result.pending.length)) {
           log(`[${acc.address}] ${describeRewards(result)}`);
         }
 
         if (CLAIM_MODE && result.ready.length) {
-          const claim = await claimAllReady(acc, result.ready);
-          result.claim = claim;
-          totalClaimed += claim.claimed;
-          totalClaimedAmount += claim.claimedAmount;
-          totalClaimFailed += claim.failed;
-          for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
-
-          const done = [`claimed ${claim.claimed}/${result.ready.length} reward${result.ready.length > 1 ? 's' : ''}`];
-          if (claim.claimed) done[0] += ` (${fmtAmount(claim.claimedAmount)})`;
-          if (claim.failed) done.push(`${claim.failed} failed (${[...claim.reasons.keys()].join(', ')})`);
-          log(`[${acc.address}] ${done.join(' | ')}`);
+          accountsWithReady.push({ acc, readyList: result.ready });
         }
       } catch (e) {
         errors++;
@@ -443,31 +445,101 @@ async function checkPending(accounts) {
   const none = results.length - withRewards.length;
   const errorText = `${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`;
 
-  if (CLAIM_MODE) {
-    const claimSummary = [
-      `claimed ${totalClaimed} reward${totalClaimed === 1 ? '' : 's'} (${fmtAmount(totalClaimedAmount)}) in ${results.filter(x => x.claim && x.claim.claimed).length} accounts`,
+  if (!CLAIM_MODE) {
+    const allReady = results.flatMap(x => x.ready);
+    const allPending = results.flatMap(x => x.pending);
+    const summary = [
+      `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts (${allReady.length} rewards)`,
+      `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts (${allPending.length} rewards)`,
     ];
-    if (totalClaimFailed) claimSummary.push(`${totalClaimFailed} failed (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
-    const nothingReady = results.filter(x => !x.ready.length).length;
-    if (nothingReady) claimSummary.push(`${nothingReady} with nothing ready to claim`);
-    if (errors) claimSummary.push(errorText);
-    if (skipped) claimSummary.push(`${skipped} without credentials`);
-    log(`[*] Claim complete: ${claimSummary.join(' | ')}.`);
+    if (allPending.length) summary.push(`next unlock in ${fmtLeft(allPending.reduce((m, p) => Math.min(m, p.left), Infinity))}`);
+    if (none) summary.push(`${none} with nothing to claim`);
+    if (errors) summary.push(errorText);
+    if (skipped) summary.push(`${skipped} without credentials`);
+    log(`[*] Pending rewards: ${summary.join(' | ')}.`);
     return;
   }
 
-  const allReady = results.flatMap(x => x.ready);
-  const allPending = results.flatMap(x => x.pending);
-  const summary = [
-    `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts (${allReady.length} rewards)`,
-    `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts (${allPending.length} rewards)`,
-  ];
-  if (allPending.length) summary.push(`next unlock in ${fmtLeft(allPending.reduce((m, p) => Math.min(m, p.left), Infinity))}`);
-  if (none) summary.push(`${none} with nothing to claim`);
-  if (errors) summary.push(errorText);
-  if (skipped) summary.push(`${skipped} without credentials`);
+  // Phase 2: Claim Loop
+  let pass = 1;
+  let currentQueue = accountsWithReady;
+  let totalClaimed = 0;
+  let totalClaimedAmount = 0;
+  let totalFatalFailed = 0;
+  let totalRetryFailed = 0;
+  let accountsWithSuccessfulClaims = 0;
+  const claimReasons = new Map();
 
-  log(`[*] Pending rewards: ${summary.join(' | ')}.`);
+  while (currentQueue.length > 0 && pass <= MAX_CLAIM_LOOPS) {
+    if (pass > 1) {
+      const itemsCount = currentQueue.reduce((n, x) => n + x.readyList.length, 0);
+      log(`[*] Claim pass ${pass}/${MAX_CLAIM_LOOPS}: retrying ${itemsCount} rewards in ${currentQueue.length} accounts (HTTP 500)...`);
+      await sleep(CLAIM_LOOP_DELAY_MS);
+    }
+
+    const nextQueue = [];
+    const claimQueue = [...currentQueue];
+
+    const claimWorker = async () => {
+      while (claimQueue.length) {
+        const { acc, readyList } = claimQueue.shift();
+        
+        if (pass === 1) {
+          log(`[${acc.address}] claiming ${fmtAmount(sum(readyList))} (${readyList.length} reward${readyList.length > 1 ? 's' : ''})...`);
+        } else {
+          log(`[${acc.address}] retrying claim for ${fmtAmount(sum(readyList))} (${readyList.length} reward${readyList.length > 1 ? 's' : ''})...`);
+        }
+
+        const claim = await claimAllReady(acc, readyList);
+        totalClaimed += claim.claimed;
+        totalClaimedAmount += claim.claimedAmount;
+        totalFatalFailed += claim.fatalFailed;
+        if (claim.claimed > 0) accountsWithSuccessfulClaims++;
+        
+        for (const [why, n] of claim.reasons) {
+          claimReasons.set(why, (claimReasons.get(why) || 0) + n);
+        }
+
+        const done = [];
+        if (claim.claimed) done.push(`claimed ${claim.claimed} (${fmtAmount(claim.claimedAmount)})`);
+        if (claim.fatalFailed) done.push(`${claim.fatalFailed} fatal fails`);
+        if (claim.retryItems.length) done.push(`${claim.retryItems.length} queued for retry (500)`);
+        
+        if (done.length) log(`[${acc.address}] ${done.join(' | ')}`);
+
+        if (claim.retryItems.length > 0) {
+          nextQueue.push({ acc, readyList: claim.retryItems });
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, claimWorker));
+
+    currentQueue = nextQueue;
+    pass++;
+  }
+
+  if (currentQueue.length > 0) {
+    const remaining = currentQueue.reduce((n, x) => n + x.readyList.length, 0);
+    totalRetryFailed = remaining;
+    log(`[!] Reached max loops (${MAX_CLAIM_LOOPS}). ${remaining} rewards in ${currentQueue.length} accounts failed with HTTP 500.`);
+    claimReasons.set('HTTP 500 server error (max loops reached)', remaining);
+  }
+
+  // Claim Summary
+  const finalFailed = totalFatalFailed + totalRetryFailed;
+  const claimSummaryStr = [
+    `claimed ${totalClaimed} reward${totalClaimed === 1 ? '' : 's'} (${fmtAmount(totalClaimedAmount)}) in ${accountsWithSuccessfulClaims} accounts`
+  ];
+  
+  if (finalFailed) claimSummaryStr.push(`${finalFailed} failed (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
+  
+  const accountsWithZeroReady = results.filter(x => !x.ready.length).length;
+  if (accountsWithZeroReady) claimSummaryStr.push(`${accountsWithZeroReady} with nothing ready to claim`);
+  if (errors) claimSummaryStr.push(errorText);
+  if (skipped) claimSummaryStr.push(`${skipped} without credentials`);
+  
+  log(`[*] Claim complete: ${claimSummaryStr.join(' | ')}.`);
 }
 
 async function checkAccount(supabase, account) {
