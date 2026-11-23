@@ -761,6 +761,7 @@ async function checkPending(accounts) {
   let totalClaimed = 0;
   let totalClaimedAmount = 0;
   let totalFatalFailed = 0;
+  let totalAttributedRewards = 0;
   let accountsWithSuccessfulClaims = 0;
   const claimReasons = new Map();
   const payerStats = new Map();
@@ -784,11 +785,13 @@ async function checkPending(accounts) {
       }
 
       if (claim.solanaErrors && claim.solanaErrors.length) {
+        totalAttributedRewards += claim.solanaErrors.length;
         for (const err of claim.solanaErrors) {
-          if (!payerStats.has(err.feePayer)) payerStats.set(err.feePayer, { lamports: 0, accounts: new Set() });
+          if (!payerStats.has(err.feePayer)) payerStats.set(err.feePayer, { lamports: 0, accounts: new Set(), rewards: 0 });
           const stat = payerStats.get(err.feePayer);
           stat.lamports += err.lamports;
           stat.accounts.add(err.address);
+          stat.rewards += 1;
         }
       }
 
@@ -816,17 +819,23 @@ async function checkPending(accounts) {
   log(`[*] Claim complete: ${claimSummaryStr.join(' | ')}.`);
 
   if (payerStats.size > 0) {
+    const totalUnattributed = totalFatalFailed - totalAttributedRewards;
     log(`\n[!] --- Solana Fee Payer Analysis ---`);
+    log(`[!] Failed rewards: ${totalFatalFailed} total | ${totalAttributedRewards} attributed to payer(s) | ${totalUnattributed} unattributable`);
+    log(`[!] (only 500 responses with embedded "insufficient lamports" + "transaction: …" can be attributed)`);
+
     if (payerStats.size === 1) {
       const [payer, stat] = [...payerStats.entries()][0];
-      log(`[!] All failed accounts use 1 payer address: ${payer}`);
-      log(`[!] Accounts: ${stat.accounts.size}`);
+      log(`[!] All attributed failures use 1 payer address: ${payer}`);
+      log(`[!] Unique accounts: ${stat.accounts.size}`);
+      log(`[!] Rewards attributed: ${stat.rewards}`);
       log(`[!] Total Lamports needed: ${stat.lamports} (approx ${(stat.lamports / 1e9).toFixed(4)} SOL)`);
     } else {
       log(`[!] Found ${payerStats.size} distinct payer addresses:`);
       for (const [payer, stat] of payerStats.entries()) {
         log(`    - Payer: ${payer}`);
-        log(`      Accounts: ${stat.accounts.size}`);
+        log(`      Unique accounts: ${stat.accounts.size}`);
+        log(`      Rewards attributed: ${stat.rewards}`);
         log(`      Total Lamports: ${stat.lamports}`);
       }
       const grandTotal = [...payerStats.values()].reduce((sum, s) => sum + s.lamports, 0);
@@ -850,7 +859,8 @@ async function checkPending(accounts) {
             `Payer: <code>${escapeHtml(payer)}</code>\n` +
             `Balance: <b>${sol.toFixed(6)} SOL</b>\n` +
             `Threshold: ${PAYER_NOTIFY_THRESHOLD_SOL} SOL\n` +
-            `Accounts affected: ${stat.accounts.size}\n` +
+            `Unique accounts: ${stat.accounts.size}\n` +
+            `Rewards attributed: ${stat.rewards}\n` +
             `Lamports needed: ${stat.lamports}`
           );
         }
