@@ -27,7 +27,7 @@ const TELEGRAM_ENABLED = process.env.TELEGRAM_ENABLED !== '0';
 const SOLANA_RPC_URLS = (process.env.SOLANA_RPC_URLS || process.env.SOLANA_RPC_URL
   || 'https://api.mainnet-beta.solana.com,https://solana-rpc.publicnode.com')
   .split(',').map(x => x.trim()).filter(Boolean);
-const PAYER_NOTIFY_THRESHOLD_SOL = Number(process.env.PAYER_NOTIFY_THRESHOLD_SOL || 0.069);
+const PAYER_NOTIFY_THRESHOLD_SOL = Number(process.env.PAYER_NOTIFY_THRESHOLD_SOL || 0.00095);
 
 // --- Intercept Fetch for Proxies ---
 {
