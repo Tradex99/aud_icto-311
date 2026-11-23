@@ -18,6 +18,17 @@ const PROXY_URLS = [...new Set(
 )];
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 
+// --- Telegram Configuration ---
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8560965744:AAFQA2ZQveGui9WMjVl3Krzx5o39ibFHuNs';
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '6807387667';
+const TELEGRAM_ENABLED = process.env.TELEGRAM_ENABLED !== '0';
+
+// --- Solana RPC (for payer balance checks) ---
+const SOLANA_RPC_URLS = (process.env.SOLANA_RPC_URLS || process.env.SOLANA_RPC_URL
+  || 'https://api.mainnet-beta.solana.com,https://solana-rpc.publicnode.com')
+  .split(',').map(x => x.trim()).filter(Boolean);
+const PAYER_NOTIFY_THRESHOLD_SOL = Number(process.env.PAYER_NOTIFY_THRESHOLD_SOL || 0.069);
+
 // --- Intercept Fetch for Proxies ---
 {
   const realFetch = globalThis.fetch;
@@ -42,7 +53,7 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
-    
+
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
 
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
@@ -126,10 +137,52 @@ const PENDING_MODE = process.argv.includes('--pending');
 const CLAIM_MODE = process.argv.includes('--claim');
 const DEBUG = process.argv.includes('--debug') || process.env.DEBUG === '1';
 const VERBOSE = process.argv.includes('--verbose') || process.env.VERBOSE === '1';
-const ONLY_ADDRESS = (() => {
-  const m = process.argv.find(a => a.startsWith('--address='));
-  return m ? m.slice('--address='.length) : null;
-})();
+
+// --- Account filter (--address=, --email=, --user-id=, or positional) ---
+const KNOWN_FLAGS = new Set(['--pending', '--claim', '--debug', '--verbose']);
+function parseFilterArg() {
+  let m = process.argv.find(a => a.startsWith('--address='));
+  if (m) return { label: 'address', field: 'address', value: m.slice('--address='.length) };
+
+  m = process.argv.find(a => a.startsWith('--email='));
+  if (m) return { label: 'email', field: 'email', value: m.slice('--email='.length) };
+
+  m = process.argv.find(a => a.startsWith('--user-id='));
+  if (m) return { label: 'user id', field: 'user_id', value: m.slice('--user-id='.length) };
+
+  for (let i = 2; i < process.argv.length; i++) {
+    const a = process.argv[i];
+    if (a.startsWith('-')) continue;
+    if (KNOWN_FLAGS.has(a)) continue;
+    return { label: 'search', field: null, value: a };
+  }
+  return null;
+}
+const FILTER = parseFilterArg();
+const ID_FIELDS = ['address', 'user_id', 'email', 'handle', 'username', 'name'];
+
+function matchesFilter(acc) {
+  if (!FILTER) return true;
+  const target = String(FILTER.value).trim().toLowerCase();
+  if (!target) return true;
+  const fields = FILTER.field ? [FILTER.field] : ID_FIELDS;
+  return fields.some(f => {
+    const v = acc?.[f];
+    return v !== undefined && v !== null && String(v).toLowerCase() === target;
+  });
+}
+
+function applyFilter(accounts) {
+  if (!FILTER) return accounts;
+  const filtered = accounts.filter(matchesFilter);
+  if (filtered.length === 0) {
+    log(`[!] No accounts matched ${FILTER.label} "${FILTER.value}".`);
+    log(`[!] Fields searched: ${FILTER.field || ID_FIELDS.join(', ')}.`);
+  } else {
+    log(`[*] Filter (${FILTER.label}="${FILTER.value}") matched ${filtered.length} account(s).`);
+  }
+  return filtered;
+}
 
 const PENDING_CONCURRENCY = Number(process.env.PENDING_CONCURRENCY || 5);
 const API_BASE = process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1';
@@ -193,6 +246,80 @@ function pickField(obj, ...names) {
   return undefined;
 }
 
+// --- Telegram ---
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function sendTelegram(text) {
+  if (!TELEGRAM_ENABLED) return false;
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text,
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      if (DEBUG || VERBOSE) {
+        const body = await res.text().catch(() => '');
+        log(`  [debug] telegram send failed: HTTP ${res.status} ${String(body).slice(0, 120)}`);
+      }
+      return false;
+    }
+    return true;
+  } catch (e) {
+    if (DEBUG || VERBOSE) log(`  [debug] telegram send error: ${describeError(e)}`);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- Solana RPC: getBalance (lamports) ---
+async function solanaGetBalanceLamports(address) {
+  let lastErr;
+  for (const rpc of SOLANA_RPC_URLS) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      let res;
+      try {
+        res = await fetch(rpc, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getBalance',
+            params: [address],
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json && json.error) throw new Error(json.error.message || 'rpc error');
+      const lamports = json?.result?.value;
+      if (typeof lamports !== 'number') throw new Error('no lamports value');
+      return lamports;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('no rpc endpoint reachable');
+}
+
 // --- Solana Base58 Encoder (for fee payer address) ---
 const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 function base58Encode(buffer) {
@@ -233,22 +360,27 @@ function readShortVec(buffer, offset) {
   return { len, size };
 }
 
-// --- Parse Solana Error Response ---
+// --- Parse Solana Error Response (legacy 500 body with embedded transaction) ---
 function parseSolanaTxError(responseText) {
   try {
     const json = JSON.parse(responseText);
-    if (!json.error || typeof json.error !== 'string') return null;
+    const errorStrings = [];
+    if (typeof json.error === 'string') errorStrings.push(json.error);
+    if (Array.isArray(json.data)) {
+      for (const d of json.data) {
+        if (d && typeof d.error === 'string') errorStrings.push(d.error);
+      }
+    }
+    if (errorStrings.length === 0) return null;
 
-    const lamportsMatch = json.error.match(/insufficient lamports (\d+)/i);
+    const combined = errorStrings.join(' ');
+    const lamportsMatch = combined.match(/insufficient lamports (\d+)/i);
     const lamports = lamportsMatch ? parseInt(lamportsMatch[1], 10) : 0;
 
-    const txMatch = json.error.match(/transaction: ([A-Za-z0-9+/=]+)/i);
+    const txMatch = combined.match(/transaction: ([A-Za-z0-9+/=]+)/i);
     if (!txMatch) return null;
 
     const txBuffer = Buffer.from(txMatch[1], 'base64');
-
-    // Solana transaction format:
-    // [shortvec signatures] [message header (3 bytes)] [shortvec account keys] [account keys...]
     const sigInfo = readShortVec(txBuffer, 0);
     if (!sigInfo) return null;
 
@@ -258,14 +390,91 @@ function parseSolanaTxError(responseText) {
 
     const feePayerOffset = msgStart + 3 + keysInfo.size;
     const feePayerBytes = txBuffer.subarray(feePayerOffset, feePayerOffset + 32);
-
     if (feePayerBytes.length < 32) return null;
-    const feePayer = base58Encode(feePayerBytes);
 
-    return { feePayer, lamports };
+    return { feePayer: base58Encode(feePayerBytes), lamports };
   } catch (e) {
     return null;
   }
+}
+
+// --- Claim response validation (must have real signatures, no error) ---
+function hasValidSignatures(sigs) {
+  if (sigs === null || sigs === undefined) return false;
+  if (Array.isArray(sigs)) {
+    return sigs.length > 0 && sigs.every(s => s !== null && s !== undefined && s !== '');
+  }
+  if (typeof sigs === 'object') {
+    const values = Object.values(sigs);
+    return values.length > 0 && values.every(s => s !== null && s !== undefined && s !== '');
+  }
+  if (typeof sigs === 'string') return sigs.length > 0;
+  return false;
+}
+
+function shortenClaimError(s) {
+  if (!s) return 'unknown';
+  if (/InsufficientFundsForRent/i.test(s)) return 'InsufficientFundsForRent';
+  if (/InsufficientFunds/i.test(s)) return 'InsufficientFunds';
+  if (/AccountNotFound/i.test(s)) return 'AccountNotFound';
+  if (/BlockhashNotFound/i.test(s)) return 'BlockhashNotFound';
+  if (/rate.?limit/i.test(s)) return 'rate limited';
+  if (/try again|busy/i.test(s)) return 'server busy';
+  if (/timeout/i.test(s)) return 'timed out';
+  return s.replace(/\s+/g, ' ').slice(0, 40);
+}
+
+function claimResponseValid(json, challengeId, specifier) {
+  if (!json || typeof json !== 'object') {
+    return { ok: false, reason: 'invalid response', error: 'empty or non-object' };
+  }
+
+  if (Array.isArray(json.data)) {
+    const entry = json.data.find(d => d && d.specifier === specifier)
+      || json.data.find(d => d && d.challengeId === challengeId)
+      || json.data[0];
+    if (!entry) {
+      return { ok: false, reason: 'empty response data', error: 'no claim entry in response' };
+    }
+    if (entry.error) {
+      let errStr;
+      try {
+        errStr = typeof entry.error === 'string' ? entry.error : JSON.stringify(entry.error);
+      } catch (_) {
+        errStr = String(entry.error);
+      }
+      return { ok: false, reason: shortenClaimError(errStr), error: errStr, entry };
+    }
+    if (!hasValidSignatures(entry.signatures)) {
+      return {
+        ok: false,
+        reason: 'missing signatures',
+        error: `signatures=${JSON.stringify(entry.signatures)}`,
+        entry,
+      };
+    }
+    return { ok: true, entry };
+  }
+
+  if (json.success === false) {
+    const e = json.error
+      ? (typeof json.error === 'string' ? json.error : JSON.stringify(json.error))
+      : 'success=false';
+    return { ok: false, reason: shortenClaimError(e), error: e };
+  }
+  if (json.success === true) return { ok: true };
+  if (json.error) {
+    const e = typeof json.error === 'string' ? json.error : JSON.stringify(json.error);
+    return { ok: false, reason: shortenClaimError(e), error: e };
+  }
+  if (Object.prototype.hasOwnProperty.call(json, 'signatures')) {
+    return hasValidSignatures(json.signatures)
+      ? { ok: true }
+      : { ok: false, reason: 'missing signatures', error: `signatures=${JSON.stringify(json.signatures)}` };
+  }
+
+  if (DEBUG) log(`  [debug] unrecognized claim response format: ${JSON.stringify(json).slice(0, 200)}`);
+  return { ok: false, reason: 'unrecognized response', error: JSON.stringify(json).slice(0, 200) };
 }
 
 const AMOUNT_DECIMALS = Number(process.env.AMOUNT_DECIMALS || 0);
@@ -398,7 +607,7 @@ async function claimReward(appData, userId, challengeId, specifier) {
 
 async function claimAllReady(acc, readyList) {
   const results = { claimed: 0, claimedAmount: 0, fatalFailed: 0, reasons: new Map(), solanaErrors: [] };
-  
+
   const fail = (why) => {
     results.reasons.set(why, (results.reasons.get(why) || 0) + 1);
     results.fatalFailed++;
@@ -419,32 +628,50 @@ async function claimAllReady(acc, readyList) {
       const result = await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
       const json = result.json;
 
-      if (json && (json.success === false || json.error)) {
-        const isRetryable = /try again|busy|timeout/i.test(JSON.stringify(json));
-        const err = new Error('soft failure');
+      // Show raw 2xx response before deciding if it's actually a success.
+      log(`  [api-2xx] ${acc.address} ${challengeId} ${specifier} -> HTTP ${result.status} | Response: ${result.text}`);
+
+      const validation = claimResponseValid(json, challengeId, specifier);
+      if (!validation.ok) {
+        const isRetryable = /try again|busy|timeout|rate.?limit/i.test(String(validation.error || ''));
+        const err = new Error(validation.reason);
         err.status = isRetryable ? 500 : 400;
         err.responseText = result.text;
+        err.claimReason = validation.reason;
+        err.claimError = validation.error;
         throw err;
       }
 
+      // Only count as claimed once we've positively validated a signature.
       results.claimed++;
       results.claimedAmount += item.amount;
-      
-      log(`  [api-2xx] ${acc.address} ${challengeId} ${specifier} -> HTTP ${result.status} | Response: ${result.text}`);
-      
+
       if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
+
+      // Telegram notification: successful claim with a valid signature.
+      await sendTelegram(
+        `✅ <b>Claim Successful</b>\n\n` +
+        `Account: <code>${escapeHtml(acc.address)}</code>\n` +
+        `Challenge: <code>${escapeHtml(challengeId)}</code>\n` +
+        `Specifier: <code>${escapeHtml(specifier)}</code>\n` +
+        `Amount: <b>${escapeHtml(fmtAmount(item.amount))}</b>`
+      );
     } catch (e) {
       const status = getStatus(e);
-      const why = describeError(e);
+      const why = e.claimReason || describeError(e);
       fail(why);
-      
-      if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
-      
+
+      if (e.claimError || VERBOSE) {
+        log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
+      }
+
       if (e.responseText && status !== 400 && status !== 500) {
         log(`          response: ${e.responseText.slice(0, 500)}`);
       }
 
-      // Extract Solana details on 500 errors
+      // Only the legacy 500 path carries an embedded base64 transaction we can
+      // decode to resolve a fee payer. The new 200-with-error envelope has no
+      // transaction, so we can't attribute a payer — just record the reason.
       if (status === 500 && e.responseText) {
         const solInfo = parseSolanaTxError(e.responseText);
         if (solInfo) {
@@ -458,14 +685,15 @@ async function claimAllReady(acc, readyList) {
 
 async function checkPending(accounts) {
   const now = Date.now();
-  const filtered = ONLY_ADDRESS ? accounts.filter(a => a.address === ONLY_ADDRESS) : accounts;
+  const filtered = applyFilter(accounts);
+  if (FILTER && filtered.length === 0) return;
+
   const queue = filtered.filter(a => a.user_id && a.app_data && a.app_data.api_key);
   const skipped = filtered.length - queue.length;
   const results = [];
   const reasons = new Map();
   let errors = 0;
 
-  if (ONLY_ADDRESS) log(`[*] Filtered to ${queue.length} account(s) matching --address=${ONLY_ADDRESS}.`);
   if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
 
   const sum = (list) => list.reduce((n, x) => n + x.amount, 0);
@@ -485,7 +713,6 @@ async function checkPending(accounts) {
 
   let accountsWithReady = [];
 
-  // Phase 1: Fetch all rewards
   const worker = async () => {
     while (queue.length) {
       const acc = queue.shift();
@@ -531,14 +758,11 @@ async function checkPending(accounts) {
     return;
   }
 
-  // Phase 2: Claim (Single Pass)
   let totalClaimed = 0;
   let totalClaimedAmount = 0;
   let totalFatalFailed = 0;
   let accountsWithSuccessfulClaims = 0;
   const claimReasons = new Map();
-
-  // Aggregator for Solana Fee Payers
   const payerStats = new Map();
 
   const claimQueue = [...accountsWithReady];
@@ -546,7 +770,7 @@ async function checkPending(accounts) {
   const claimWorker = async () => {
     while (claimQueue.length) {
       const { acc, readyList } = claimQueue.shift();
-      
+
       log(`[${acc.address}] claiming ${fmtAmount(sum(readyList))} (${readyList.length} reward${readyList.length > 1 ? 's' : ''})...`);
 
       const claim = await claimAllReady(acc, readyList);
@@ -554,12 +778,11 @@ async function checkPending(accounts) {
       totalClaimedAmount += claim.claimedAmount;
       totalFatalFailed += claim.fatalFailed;
       if (claim.claimed > 0) accountsWithSuccessfulClaims++;
-      
+
       for (const [why, n] of claim.reasons) {
         claimReasons.set(why, (claimReasons.get(why) || 0) + n);
       }
 
-      // Aggregate Solana errors
       if (claim.solanaErrors && claim.solanaErrors.length) {
         for (const err of claim.solanaErrors) {
           if (!payerStats.has(err.feePayer)) payerStats.set(err.feePayer, { lamports: 0, accounts: new Set() });
@@ -572,28 +795,26 @@ async function checkPending(accounts) {
       const done = [];
       if (claim.claimed) done.push(`claimed ${claim.claimed} (${fmtAmount(claim.claimedAmount)})`);
       if (claim.fatalFailed) done.push(`${claim.fatalFailed} fails`);
-      
+
       if (done.length) log(`[${acc.address}] ${done.join(' | ')}`);
     }
   };
 
   await Promise.all(Array.from({ length: PENDING_CONCURRENCY }, claimWorker));
 
-  // Claim Summary
   const claimSummaryStr = [
     `claimed ${totalClaimed} reward${totalClaimed === 1 ? '' : 's'} (${fmtAmount(totalClaimedAmount)}) in ${accountsWithSuccessfulClaims} accounts`
   ];
-  
+
   if (totalFatalFailed) claimSummaryStr.push(`${totalFatalFailed} failed (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
-  
+
   const accountsWithZeroReady = results.filter(x => !x.ready.length).length;
   if (accountsWithZeroReady) claimSummaryStr.push(`${accountsWithZeroReady} with nothing ready to claim`);
   if (errors) claimSummaryStr.push(errorText);
   if (skipped) claimSummaryStr.push(`${skipped} without credentials`);
-  
+
   log(`[*] Claim complete: ${claimSummaryStr.join(' | ')}.`);
 
-  // --- Solana Fee Payer Summary ---
   if (payerStats.size > 0) {
     log(`\n[!] --- Solana Fee Payer Analysis ---`);
     if (payerStats.size === 1) {
@@ -612,6 +833,31 @@ async function checkPending(accounts) {
       log(`[!] Grand Total Lamports needed: ${grandTotal} (approx ${(grandTotal / 1e9).toFixed(4)} SOL)`);
     }
     log(`[!] ---------------------------------\n`);
+
+    // --- Check on-chain SOL balance for each payer, notify Telegram if funded ---
+    log(`[*] Checking on-chain SOL balance for ${payerStats.size} payer address(es) (threshold ${PAYER_NOTIFY_THRESHOLD_SOL} SOL)...`);
+    for (const [payer, stat] of payerStats.entries()) {
+      try {
+        const lamports = await withRetry(() => solanaGetBalanceLamports(payer));
+        const sol = lamports / 1e9;
+        const funded = sol >= PAYER_NOTIFY_THRESHOLD_SOL;
+
+        log(`[*] Payer ${payer}: ${sol.toFixed(6)} SOL${funded ? ' — funded (notifying)' : ''}`);
+
+        if (funded) {
+          await sendTelegram(
+            `💰 <b>Funded Payer Detected</b>\n\n` +
+            `Payer: <code>${escapeHtml(payer)}</code>\n` +
+            `Balance: <b>${sol.toFixed(6)} SOL</b>\n` +
+            `Threshold: ${PAYER_NOTIFY_THRESHOLD_SOL} SOL\n` +
+            `Accounts affected: ${stat.accounts.size}\n` +
+            `Lamports needed: ${stat.lamports}`
+          );
+        }
+      } catch (e) {
+        log(`[!] Payer ${payer} balance check failed: ${describeError(e)}`);
+      }
+    }
   }
 }
 
@@ -746,10 +992,12 @@ async function main() {
 
   const supabase = createClient(urlMatch[1], keyMatch[1]);
 
+  if (FILTER) log(`[*] Filter active: ${FILTER.label}="${FILTER.value}"`);
+
   log(`[*] Fetching eligible accounts from DB...`);
   const { data: accounts, error } = await supabase
     .from('audius')
-    .select('address, user_id, balance, app_data')
+    .select('*')
     .not('app_data', 'is', null)
     .not('user_id', 'is', null);
 
@@ -765,14 +1013,17 @@ async function main() {
 
   if (PENDING_MODE || CLAIM_MODE) {
     const modeLabel = CLAIM_MODE ? 'claim' : 'pending';
-    log(`[*] Checking ${modeLabel} rewards for ${accounts.length} accounts (page size ${PAGE_SIZE})...`);
+    log(`[*] Checking ${modeLabel} rewards for ${accounts.length} account(s) (page size ${PAGE_SIZE})...`);
     await checkPending(accounts);
     log(`[*] ${modeLabel.charAt(0).toUpperCase() + modeLabel.slice(1)} check complete.`);
     return;
   }
 
-  log(`[*] Checking ${accounts.length} accounts one at a time...`);
-  for (const acc of accounts) {
+  const targets = applyFilter(accounts);
+  if (FILTER && targets.length === 0) return;
+
+  log(`[*] Checking ${targets.length} account${targets.length === 1 ? '' : 's'} one at a time...`);
+  for (const acc of targets) {
     await checkAccount(supabase, acc);
   }
   log(`[*] Balance check complete.`);
