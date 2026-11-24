@@ -43,7 +43,10 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     return pool[Math.floor(Math.random() * pool.length)];
   };
 
-  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+  if (!global.__AUDIUS_PROXY_LOGGED) {
+    console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+    global.__AUDIUS_PROXY_LOGGED = true;
+  }
   globalThis.fetch = async (input, init) => {
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
@@ -129,6 +132,11 @@ const DB_FILE = path.join(ROOT_DIR, 'db.txt');
 const STATE_FILE = path.join(ROOT_DIR, '.audius_stream_state.json');
 const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
+// Custom runs (from tastemaker handle= + stream=) use run numbers 100..199 so they
+// never collide with scheduled daily runs 1..99.
+const CUSTOM_RUN_START = 100;
+const CUSTOM_RUN_END = 200;
+
 const CFG = {
   timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
   resetHour: Number(process.env.RESET_HOUR ?? 12),
@@ -151,7 +159,6 @@ const CFG = {
   workerCount: 10,
   workerStaggerMs: Number(process.env.WORKER_STAGGER_MS || 5000),
   workerJitterMs: Number(process.env.WORKER_JITTER_MS || 2000),
-  // trending tuning
   trendingLimit: Number(process.env.TRENDING_LIMIT || 100),
   trendingTopMin: Number(process.env.TRENDING_TOP_MIN || 10),
   trendingTopMax: Number(process.env.TRENDING_TOP_MAX || 20),
@@ -495,11 +502,21 @@ function allDoneMsg(n) {
   return `[*] All ${n} tracks reached their daily stream limit. Exiting.`;
 }
 
+// Scheduled runs use 1..99. Custom runs (from tastemaker) use 100..199.
 function dayState(coord, today) {
-  const todays = (coord.batches || []).filter(x => x.date === today);
+  const todays = (coord.batches || []).filter(x => x.date === today && x.run_number < CUSTOM_RUN_START);
   const open = todays.find(x => !x.done);
   if (open) return { runNumber: open.run_number, batch: open };
   return { runNumber: todays.reduce((m, x) => Math.max(m, x.run_number), 0) + 1, batch: null };
+}
+
+// First free custom slot for today.
+function nextCustomRunNumber(coord, today) {
+  for (let n = CUSTOM_RUN_START; n < CUSTOM_RUN_END; n++) {
+    const b = (coord.batches || []).find(x => x.date === today && x.run_number === n);
+    if (!b || !b.done) return { runNumber: n, batch: b || null };
+  }
+  return null;
 }
 
 function reason(e) {
@@ -734,10 +751,6 @@ function countTracks(rows, ctx, runNumber) {
   return counts;
 }
 
-/**
- * Fetch trending tracks (top N) from Audius.
- * Retries on 429/5xx; returns [] on hard failure (safe fallback: stream all).
- */
 async function fetchTrendingList(limit = CFG.trendingLimit) {
   const url = `https://api.audius.co/v1/tracks/trending?time=week&limit=${limit}`;
   let lastErr;
@@ -763,7 +776,9 @@ async function fetchTrendingList(limit = CFG.trendingLimit) {
   return [];
 }
 
-async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
+// MODIFIED: accepts custom + excludeUser. For custom runs, trending selection is skipped
+// and per-track limits are driven by the caller (target == cap == maxPerRun).
+async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom = false, excludeUser = null }) {
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
     user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r),
@@ -773,102 +788,100 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   if (!reader) throw new Error('no account with complete credentials');
 
   const targetAddrs = new Set(rawTargets.map(p => p.address).filter(Boolean));
-  const excluded = new Set(accounts.filter(a => targetAddrs.has(a.address)).map(a => a.address));
+  const excluded = new Set(
+    accounts.filter(a =>
+      targetAddrs.has(a.address) ||
+      (excludeUser && String(a.user_id) === String(excludeUser))
+    ).map(a => a.address)
+  );
 
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
 
-  // =========================================================================
-  // TRENDING-AWARE TARGET SELECTION
-  // =========================================================================
-  // Strategy for current-week tracks (from up_tracks):
-  //   - rank < targetRangeMin (23)         -> SKIP (above range, don't push higher)
-  //   - rank in [23, 27]                   -> SKIP (sitting in target range)
-  //   - rank > 27 or not in trending       -> STREAM (push up into range)
-  //
-  // This naturally maintains ~5 tracks in positions 23-27: tracks that
-  // enter the band are skipped, so they decay out over time; when they fall
-  // past 27 they're picked up again and pushed back in.
-  //
-  // Requirement 6A (previous-week bonus):
-  //   Any track in trending positions 10-20 owned by an account in the
-  //   audius table (but NOT one of our current up_tracks) gets 100
-  //   streams per run to push it towards top 1-9.
-  // =========================================================================
-  const trendingTracks = await fetchTrendingList();
-  const rankMap = new Map();
-  const ownerMap = new Map();
-  const handleMap = new Map();
+  let targets;
 
-  accounts.forEach(a => {
-    if (a.user_id) ownerMap.set(String(a.user_id), a);
-    if (a.handle) handleMap.set(a.handle.toLowerCase(), a);
-  });
+  if (custom) {
+    // Custom runs: no trending logic — use rawTargets as-is.
+    targets = rawTargets;
+    log(`[*] Custom stream run ${runNumber}${batch ? ' (resumed)' : ''}: ${targets.length} track(s), target ${targets[0].cap} stream(s) each.`);
+  } else {
+    // Scheduled runs: trending-aware target selection.
+    const trendingTracks = await fetchTrendingList();
+    const rankMap = new Map();
+    const ownerMap = new Map();
+    const handleMap = new Map();
 
-  trendingTracks.forEach((t, i) => rankMap.set(t.id, i + 1));
-
-  // --- Categorize current up_tracks by trending position ---
-  const targetTrackIds = new Set(rawTargets.map(t => t.key || t.id));
-  const belowRange = [];  // rank > 27 or not trending -> stream
-  const inRange = [];     // 23 <= rank <= 27 -> skip (target hit)
-  const aboveRange = [];  // rank < 23 -> skip (too high)
-
-  for (const t of rawTargets) {
-    const rank = rankMap.get(t.id);
-    if (rank === undefined || rank > CFG.targetRangeMax) belowRange.push(t);
-    else if (rank >= CFG.targetRangeMin) inRange.push(t);
-    else aboveRange.push(t);
-  }
-
-  // --- Previous-week bonus targets (trending 10-20, our accounts, not up_tracks) ---
-  const previousTargets = [];
-  const previousSeen = new Set();
-  trendingTracks.forEach((t, i) => {
-    const rank = i + 1;
-    if (rank < CFG.trendingTopMin || rank > CFG.trendingTopMax) return;
-    if (targetTrackIds.has(t.id) || previousSeen.has(t.id)) return;
-    const u = t.user || {};
-    const owner = ownerMap.get(String(u.id)) || handleMap.get(String((u.handle || '').toLowerCase()));
-    if (!owner) return;
-    previousSeen.add(t.id);
-    previousTargets.push({
-      id: t.id, key: t.id,
-      address: owner.address, handle: owner.handle,
-      date: ctx.today, day: ctx.dayName,
-      cap: CFG.dailyPerTrack, maxPerRun: CFG.previousWeekPerRun,
-      source: 'previous', trendingRank: rank,
+    accounts.forEach(a => {
+      if (a.user_id) ownerMap.set(String(a.user_id), a);
+      if (a.handle) handleMap.set(a.handle.toLowerCase(), a);
     });
-  });
 
-  // --- Diagnostic log: show every up_track and where it sits ---
-  if (rawTargets.length) {
-    const positions = rawTargets.map(t => {
-      const r = rankMap.get(t.id);
-      return `${String(t.id).slice(0, 8)}:${r === undefined ? 'n/a' : `#${r}`}`;
-    }).join(' ');
-    log(`[*] Up_tracks positions: ${positions}`);
-  }
-  log(`[*] Trending: ${inRange.length} in [${CFG.targetRangeMin}-${CFG.targetRangeMax}] (skip), ` +
-      `${aboveRange.length} above ${CFG.targetRangeMin} (skip), ` +
-      `${belowRange.length} below ${CFG.targetRangeMax}/not trending (stream)` +
-      `${previousTargets.length ? `, ${previousTargets.length} previous-week [${CFG.trendingTopMin}-${CFG.trendingTopMax}] bonus` : ''}`);
+    trendingTracks.forEach((t, i) => rankMap.set(t.id, i + 1));
 
-  const targets = [...belowRange, ...previousTargets];
-  // =========================================================================
+    const targetTrackIds = new Set(rawTargets.map(t => t.key || t.id));
+    const belowRange = [];
+    const inRange = [];
+    const aboveRange = [];
 
-  if (!targets.length) {
-    log(`[*] All ${rawTargets.length} up_tracks at trending 1-${CFG.targetRangeMax} (above or in target range). Nothing to stream.`);
-    await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-      if (!h.batches) h.batches = [];
-      const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
-      if (b && b.done) return false;
-      if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
-      return true;
+    for (const t of rawTargets) {
+      const rank = rankMap.get(t.id);
+      if (rank === undefined || rank > CFG.targetRangeMax) belowRange.push(t);
+      else if (rank >= CFG.targetRangeMin) inRange.push(t);
+      else aboveRange.push(t);
+    }
+
+    const previousTargets = [];
+    const previousSeen = new Set();
+    trendingTracks.forEach((t, i) => {
+      const rank = i + 1;
+      if (rank < CFG.trendingTopMin || rank > CFG.trendingTopMax) return;
+      if (targetTrackIds.has(t.id) || previousSeen.has(t.id)) return;
+      const u = t.user || {};
+      const owner = ownerMap.get(String(u.id)) || handleMap.get(String((u.handle || '').toLowerCase()));
+      if (!owner) return;
+      previousSeen.add(t.id);
+      previousTargets.push({
+        id: t.id, key: t.id,
+        address: owner.address, handle: owner.handle,
+        date: ctx.today, day: ctx.dayName,
+        cap: CFG.dailyPerTrack, maxPerRun: CFG.previousWeekPerRun,
+        source: 'previous', trendingRank: rank,
+      });
     });
-    return { status: 'COMPLETED' };
+
+    if (rawTargets.length) {
+      const positions = rawTargets.map(t => {
+        const r = rankMap.get(t.id);
+        return `${String(t.id).slice(0, 8)}:${r === undefined ? 'n/a' : `#${r}`}`;
+      }).join(' ');
+      log(`[*] Up_tracks positions: ${positions}`);
+    }
+    log(`[*] Trending: ${inRange.length} in [${CFG.targetRangeMin}-${CFG.targetRangeMax}] (skip), ` +
+        `${aboveRange.length} above ${CFG.targetRangeMin} (skip), ` +
+        `${belowRange.length} below ${CFG.targetRangeMax}/not trending (stream)` +
+        `${previousTargets.length ? `, ${previousTargets.length} previous-week [${CFG.trendingTopMin}-${CFG.trendingTopMax}] bonus` : ''}`);
+
+    targets = [...belowRange, ...previousTargets];
+
+    if (!targets.length) {
+      log(`[*] All ${rawTargets.length} up_tracks at trending 1-${CFG.targetRangeMax} (above or in target range). Nothing to stream.`);
+      await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+        if (!h.batches) h.batches = [];
+        const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
+        if (b && b.done) return false;
+        if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
+        return true;
+      });
+      return { status: 'COMPLETED' };
+    }
   }
 
+  // For custom runs, attempts & maxOk are scoped to this run slot only.
   const need = new Map(targets.map(t => {
+    if (custom) {
+      const remaining = Math.max(0, t.cap - (runDone.get(t.key) || 0));
+      return [t.key, { attempts: remaining, maxOk: remaining }];
+    }
     const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
     const attempts = Math.max(0, t.maxPerRun - (runDone.get(t.key) || 0));
     return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
@@ -884,7 +897,7 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   }
 
   if (!totalNeed) {
-    if (!tracksBelowCap(rows, targets, ctx).length) {
+    if (!custom && !tracksBelowCap(rows, targets, ctx).length) {
       log(allDoneMsg(targets.length));
       return { status: 'ALREADY_COMPLETED' };
     }
@@ -899,7 +912,7 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
     return { status: 'COMPLETED' };
   }
 
-  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
+  const atCap = custom ? 0 : targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
   log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} streams.`);
 
   if (!batch) {
@@ -930,11 +943,12 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
 
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
+    const inRun = (runDone.get(t.key) || 0) + got;
     const tag = t.source === 'previous' ? ` (bonus, was #${t.trendingRank})` : '';
     if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id}${tag} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
+      log(`[!] track ${t.id}${tag} | ${custom ? `${inRun}/${t.cap} this run` : `${day}/${t.cap} today`} (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
     } else {
-      log(`[*] track ${t.id}${tag} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id}${tag} | ${custom ? `${inRun}/${t.cap} this run` : `${day}/${t.cap} today`}${custom ? '' : day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
     if (run.stop) incomplete = true;
   }
@@ -961,6 +975,7 @@ async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch }) {
   return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
 }
 
+// Scheduled entry point (unchanged behavior).
 async function runStream({ now = new Date() } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
@@ -1005,6 +1020,87 @@ async function runStream({ now = new Date() } = {}) {
   }
 }
 
+// ============ NEW: runStreams (tastemaker integration) ============
+// Called from tastemaker.js with a specific track list and per-track target.
+// Uses a custom run number (100..199) so it never collides with the scheduled runs.
+//
+//   runStreams({ tracks: [{ id, title }], target: 10000 })
+//   runStreams({ tracks: [...], target: 10000, excludeUser: 'user-id-to-exclude' })
+//
+// Semantics: "do up to `target` streams per track in THIS invocation". Running twice
+// allocates a fresh custom run number and adds `target` more, unless the pool runs out.
+async function runStreams({ tracks, target, excludeUser = null, now = new Date() } = {}) {
+  if (!Number.isInteger(target) || target <= 0) {
+    throw new Error(`runStreams: target must be a positive integer (got ${target})`);
+  }
+  if (!Array.isArray(tracks) || !tracks.length) {
+    throw new Error('runStreams: tracks array is required');
+  }
+
+  const ctx = buildContext(now);
+  const sb = connectSupabase();
+  PENDING = loadPending();
+
+  const rawTargets = tracks.map(t => ({
+    id: String(t.id),
+    key: String(t.id),
+    address: t.address || null,
+    handle: t.handle || null,
+    date: ctx.today,
+    day: ctx.dayName,
+    cap: target,
+    maxPerRun: target,
+    source: 'custom',
+  }));
+
+  log(`[*] runStreams: ${rawTargets.length} track(s), target ${target} stream(s) per track (total ${rawTargets.length * target}).`);
+
+  const lock = await acquireLock(sb, ctx);
+  if (!lock) return { status: 'LOCKED' };
+  HELD_LOCK = lock;
+  LOCK_LOST = null;
+  const stopHeartbeat = startHeartbeat(sb, ctx);
+
+  try {
+    await flushPending(sb, ctx);
+    const rows = await fetchRows(sb);
+    const coord = normalizeStream(rows.find(r => r.address === TARGET_ADDRESS).stream, ctx.weekStart);
+    const slot = nextCustomRunNumber(coord, ctx.today);
+    if (!slot) {
+      log('[*] runStreams: no free custom run slot today (100..199 all used).');
+      return { status: 'ALREADY_COMPLETED' };
+    }
+
+    const runDone = countTracks(rows, ctx, slot.runNumber);
+    let anyNeed = false;
+    for (const t of rawTargets) {
+      if ((runDone.get(t.key) || 0) < target) { anyNeed = true; break; }
+    }
+    if (!anyNeed) {
+      log(`[*] runStreams: all tracks already at ${target} in run ${slot.runNumber}.`);
+      await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+        if (!h.batches) h.batches = [];
+        const b = h.batches.find(x => x.date === ctx.today && x.run_number === slot.runNumber);
+        if (b && b.done) return false;
+        if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: slot.runNumber, done: true });
+        return true;
+      });
+      return { status: 'ALREADY_COMPLETED' };
+    }
+
+    return await processRun(sb, ctx, rows, rawTargets, {
+      runNumber: slot.runNumber,
+      batch: slot.batch,
+      custom: true,
+      excludeUser,
+    });
+  } finally {
+    stopHeartbeat();
+    HELD_LOCK = null;
+    await releaseLock(sb, ctx, lock);
+  }
+}
+
 if (require.main === module) {
   runStream().catch(err => {
     console.error('[!] Fatal error:', err.message || err);
@@ -1012,4 +1108,10 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runStream, collectTracks, buildContext, CFG };
+module.exports = {
+  runStream,
+  runStreams,
+  collectTracks,
+  buildContext,
+  CFG,
+};

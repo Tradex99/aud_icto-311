@@ -10,6 +10,8 @@ const DEFAULT_FEED_LIMIT = 30;
 const DEFAULT_MAX_TRACKS_PER_RUN = 5;
 const DEFAULT_FIRST_RUN_TRACKS = 10;
 const TARGET_INTERACTIONS = 20;
+const FOCUS_DEFAULT_TARGET = 200;
+const DEFAULT_COMMENTS_PER_TRACK = 50;
 const FEED_TRACK_MAX_AGE_MS = 24 * 3600 * 1000;
 const STATE_VERSION_MAX_TRACKS = 1000;
 
@@ -43,7 +45,11 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     return pool[Math.floor(Math.random() * pool.length)];
   };
 
-  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+  if (!global.__AUDIUS_PROXY_LOGGED) {
+    console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+    global.__AUDIUS_PROXY_LOGGED = true;
+  }
+
   globalThis.fetch = async (input, init) => {
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
@@ -158,10 +164,83 @@ const CFG = {
   loopIntervalMs: Number(process.env.LOOP_INTERVAL_SECONDS || 60) * 1000,
   feedBackoffBaseMs: Number(process.env.FEED_BACKOFF_BASE_MS || 10000),
   feedBackoffMaxMs: Number(process.env.FEED_BACKOFF_MAX_MS || 60000),
-  // Pre-check: a track that already has this many favorites AND reposts is left alone.
   skipAtCount: Number(process.env.SKIP_AT_COUNT || 5),
-  skipWhen: /^either$/i.test(process.env.SKIP_WHEN || '') ? 'either' : 'both', // SKIP_WHEN=either: skip if favorites OR reposts reach the count
+  skipWhen: /^either$/i.test(process.env.SKIP_WHEN || '') ? 'either' : 'both',
+  commentsPerTrack: Number(process.env.COMMENTS_PER_TRACK || DEFAULT_COMMENTS_PER_TRACK),
+  focusMaxTracks: Number(process.env.FOCUS_MAX_TRACKS || 0),
+  _feedTarget: null,
 };
+
+// ============ CLI ARGS ============
+const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
+
+// NEW: parse "1000", "10k", "1m", "1.5k" etc.
+function parseCount(str) {
+  if (str === null || str === undefined) return null;
+  const s = String(str).trim().toLowerCase();
+  const m = s.match(/^(\d+(?:\.\d+)?)([kmb])?$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const mult = m[2] === 'k' ? 1000 : m[2] === 'm' ? 1000000 : m[2] === 'b' ? 1000000000 : 1;
+  const result = Math.floor(n * mult);
+  return Number.isInteger(result) && result > 0 ? result : null;
+}
+
+function parseCliFocus() {
+  const args = process.argv.slice(2);
+  const handleArg = args.find(a => /^handle=/i.test(a));
+  const targetArg = args.find(a => /^target=/i.test(a));
+  const streamArg = args.find(a => /^stream=/i.test(a));
+
+  let focus = null;
+  if (handleArg) {
+    const raw = handleArg.slice(handleArg.indexOf('=') + 1).trim().replace(/^@/, '');
+    if (!HANDLE_RE.test(raw)) {
+      log(`[!] Ignoring invalid handle=${raw} (must match ${HANDLE_RE}).`);
+    } else {
+      focus = {
+        handle: raw,
+        target: FOCUS_DEFAULT_TARGET,
+        commentTarget: CFG.commentsPerTrack,
+        streamTarget: 0,
+        excludeUser: null,
+      };
+      const cmt = focus.commentTarget > 0 ? ` + ${focus.commentTarget} comments/track` : '';
+      log(`[*] Focus mode: handle=@${raw} (target ${FOCUS_DEFAULT_TARGET} favs/reposts${cmt} per track, today's uploads only).`);
+    }
+  }
+
+  if (targetArg) {
+    const raw = targetArg.slice(targetArg.indexOf('=') + 1).trim();
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) {
+      log(`[!] Ignoring invalid target=${raw} (must be a non-negative integer).`);
+    } else if (focus) {
+      focus.target = n;
+      if (n === 0) log('[*] Focus: fav/repost disabled (target=0).');
+      else log(`[*] Focus target set to ${n} favs/reposts per track.`);
+    } else {
+      if (n === 0) log('[!] target=0 is only valid with handle= in focus mode; ignoring.');
+      else { CFG._feedTarget = n; log(`[*] Feed target set to ${n} favs/reposts per track.`); }
+    }
+  }
+
+  if (streamArg) {
+    const raw = streamArg.slice(streamArg.indexOf('=') + 1).trim();
+    const n = parseCount(raw);
+    if (n === null) {
+      log(`[!] Ignoring invalid stream=${raw} (must be positive, e.g. 1000, 10k, 1m).`);
+    } else if (focus) {
+      focus.streamTarget = n;
+      log(`[*] Focus: stream target set to ${n} streams per track (via ./stream.js).`);
+      if (n >= 5000) log(`[!] Note: ${n} streams/track with ~${CFG.streamDurationMs / 1000}s/stream and 10 workers ≈ ${Math.ceil((n * CFG.streamDurationMs) / 1000 / 10 / 3600)}h per track. Set MAX_RUN_MINUTES to cap.`);
+    } else {
+      log('[!] stream= is only supported with handle= (focus mode); ignoring.');
+    }
+  }
+
+  return focus;
+}
 
 // ============ UTILITIES ============
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -218,6 +297,22 @@ const readRetry = fn => withRetry(() => withTimeout(fn()), e => !isRateLimit(e) 
 function addDays(ymd, n) {
   const [y, m, d] = ymd.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+}
+
+function ymdInTz(iso, tz) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return null;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(d);
+    const p = {};
+    for (const x of parts) p[x.type] = x.value;
+    return `${p.year}-${p.month}-${p.day}`;
+  } catch (_) {
+    return null;
+  }
 }
 
 function buildContext(now) {
@@ -316,6 +411,10 @@ function normalizeTmaker(raw, weekStart) {
     if (!isObj(h.fed_tracks)) h.fed_tracks = {};
     if (!isObj(h.cooldowns)) h.cooldowns = {};
     if (typeof h.first_run_done !== 'boolean') h.first_run_done = false;
+    for (const e of Object.values(h.fed_tracks)) {
+      if (!Array.isArray(e.favorited_by)) e.favorited_by = [];
+      if (!Array.isArray(e.reposted_by)) e.reposted_by = [];
+    }
     return h;
   }
   const h = {
@@ -469,10 +568,7 @@ async function audiusGet(pathname, what, timeoutMs = CFG.callTimeoutMs) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, {
-        headers: { Accept: 'application/json' },
-        signal: controller.signal,
-      });
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
       if (!res.ok) {
         if (res.status === 429 || res.status >= 500) {
           lastErr = Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
@@ -611,10 +707,40 @@ function isTrendingDue(state) {
   return Date.now() - last >= CFG.trendingCheckMs;
 }
 
-// ============ FEED ============
+// ============ FEED / FOCUS TRACK SOURCES ============
 async function fetchFeed(userId, limit = CFG.feedLimit) {
   const path = `/v1/users/${encodeURIComponent(userId)}/feed?limit=${limit}&app_name=tastemaker`;
   return audiusGet(path, 'feed', CFG.feedTimeoutMs);
+}
+
+async function fetchUserByHandle(handle) {
+  const data = await audiusGet(`/v1/users/handle/${encodeURIComponent(handle)}?app_name=tastemaker`, 'user lookup', CFG.callTimeoutMs);
+  const user = Array.isArray(data) ? data[0] : data;
+  if (!user || !user.id) throw new Error(`user not found: @${handle}`);
+  return user;
+}
+
+async function fetchUserTracks(userId) {
+  const out = [];
+  const seen = new Set();
+  const page = 100;
+  for (let offset = 0; offset < 2000; offset += page) {
+    const data = await audiusGet(`/v1/users/${encodeURIComponent(userId)}/tracks?limit=${page}&offset=${offset}&sort=date&app_name=tastemaker`, 'user tracks', CFG.callTimeoutMs);
+    const list = Array.isArray(data) ? data : [];
+    for (const t of list) {
+      const id = String(t.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        user: t.user || { id: userId },
+        title: t.title || '',
+        created_at: t.created_at || t.release_date || null,
+      });
+    }
+    if (list.length < page) break;
+  }
+  return out;
 }
 
 function extractTracks(feedItems) {
@@ -650,9 +776,7 @@ function pruneFedTracks(state) {
   state.fed_tracks = Object.fromEntries(kept);
 }
 
-// ============ TRACK DETAILS PRE-CHECK ============
-// Tastemaker rewards only go to the first few fans of a track, so before touching a track we
-// read its current favorite/repost counts and leave it alone if it is already past that point.
+// ============ TRACK DETAILS PRE-CHECK (feed mode only) ============
 async function fetchTrackCounts(trackId) {
   const data = await audiusGet(`/v1/tracks/${encodeURIComponent(trackId)}?app_name=tastemaker`, 'track details', CFG.callTimeoutMs);
   const t = Array.isArray(data) ? data[0] : data;
@@ -668,6 +792,7 @@ function isAlreadyPopular({ favs, reps }) {
   return CFG.skipWhen === 'either' ? (favs >= n || reps >= n) : (favs >= n && reps >= n);
 }
 
+// ============ INTERACTIONS (favs + reposts only) ============
 async function interactTask(state, trackId, kind, acct) {
   const entry = state.fed_tracks[trackId];
   if (!entry) return { status: 'skip' };
@@ -703,9 +828,10 @@ async function runBatch(tasks, concurrency) {
 async function interactTrackKind(state, trackId, kind, pool, targetCount) {
   const entry = state.fed_tracks[trackId];
   if (!entry) return { done: false, reason: 'no-entry' };
+  if (!Array.isArray(entry[kind])) entry[kind] = [];
   const triedForThisTrack = new Set();
   let batchCount = 0;
-  const MAX_BATCHES = 30;
+  const MAX_BATCHES = 60;
 
   while (entry[kind].length < targetCount) {
     if (LOCK_LOST) return { done: false, reason: 'lock-lost' };
@@ -748,6 +874,7 @@ async function interactTrackKind(state, trackId, kind, pool, targetCount) {
   return { done: true, partial: entry[kind].length };
 }
 
+// ============ FEED BACKOFF ============
 function shouldSkipFeed(state) {
   if (FORCE_FEED) return false;
   if (!state.feed_retry_at) return false;
@@ -771,38 +898,161 @@ function recordFeedSuccess(state) {
   state.feed_retry_at = null;
 }
 
-async function doFeedInteract(sb, ctx, state, pool, primary) {
-  let feedItems;
+// ============ DELEGATE TO comment.js ============
+async function delegateComments(focus, tracks) {
+  if (!focus || !focus.commentTarget || focus.commentTarget <= 0) return null;
+  if (!tracks || !tracks.length) return null;
+
+  let commentMod;
   try {
-    feedItems = await fetchFeed(primary.user_id, CFG.feedLimit);
+    commentMod = require('./comment');
   } catch (e) {
-    const backoff = recordFeedFailure(state);
-    await saveState(sb, ctx, state);
-    log(`[!] Feed fetch failed (attempt ${state.feed_fail_count}, retry in ${Math.round(backoff / 1000)}s): ${errMsg(e).slice(0, 60)}`);
-    return;
+    log(`[!] Focus: cannot load ./comment.js (${e.message}); skipping comment step.`);
+    return null;
   }
-  recordFeedSuccess(state);
+  if (!commentMod || typeof commentMod.runComments !== 'function') {
+    log('[!] Focus: ./comment.js does not export runComments(); skipping comment step.');
+    return null;
+  }
 
-  const tracks = extractTracks(feedItems);
+  try {
+    const result = await commentMod.runComments({
+      handle: focus.handle,
+      tracks: tracks.map(t => ({ id: t.id, title: t.title || '' })),
+      target: focus.commentTarget,
+    });
+    return result && result.status;
+  } catch (e) {
+    log(`[!] Focus: comment step failed: ${errMsg(e).slice(0, 100)}`);
+    return 'ERROR';
+  }
+}
+
+// ============ NEW: DELEGATE TO stream.js ============
+async function delegateStreams(focus, tracks) {
+  if (!focus || !focus.streamTarget || focus.streamTarget <= 0) return null;
+  if (!tracks || !tracks.length) return null;
+
+  let streamMod;
+  try {
+    streamMod = require('./stream');
+  } catch (e) {
+    log(`[!] Focus: cannot load ./stream.js (${e.message}); skipping stream step.`);
+    return null;
+  }
+  if (!streamMod || typeof streamMod.runStreams !== 'function') {
+    log('[!] Focus: ./stream.js does not export runStreams(); skipping stream step.');
+    return null;
+  }
+
+  try {
+    const result = await streamMod.runStreams({
+      tracks: tracks.map(t => ({ id: t.id, title: t.title || '' })),
+      target: focus.streamTarget,
+      excludeUser: focus.excludeUser || null,
+    });
+    return result && result.status;
+  } catch (e) {
+    log(`[!] Focus: stream step failed: ${errMsg(e).slice(0, 100)}`);
+    return 'ERROR';
+  }
+}
+
+// ============ FEED / FOCUS WORKER ============
+async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
+  let tracks;
+  let trackSource;
+
+  if (focus) {
+    let user;
+    try {
+      user = await fetchUserByHandle(focus.handle);
+    } catch (e) {
+      log(`[!] Could not look up @${focus.handle}: ${errMsg(e).slice(0, 80)}`);
+      return;
+    }
+    log(`[*] Focus: @${user.handle || focus.handle} (${user.id}).`);
+    // Remember the target user so delegateStreams can exclude their alts from the pool.
+    focus.excludeUser = String(user.id);
+
+    try {
+      tracks = await fetchUserTracks(user.id);
+    } catch (e) {
+      log(`[!] Could not fetch tracks for @${focus.handle}: ${errMsg(e).slice(0, 80)}`);
+      return;
+    }
+    log(`[*] Focus: ${tracks.length} total track(s) found.`);
+
+    // Only process today's uploads.
+    const today = ctx.today;
+    const tz = CFG.dayTimezone;
+    const todayTracks = tracks.filter(t => t.created_at && ymdInTz(t.created_at, tz) === today);
+
+    if (!todayTracks.length) {
+      log(`[!] Focus: no latest tracks found — @${user.handle || focus.handle} has no tracks uploaded today (${today} ${tz}). Exiting.`);
+      return;
+    }
+
+    todayTracks.sort((a, b) => {
+      const at = a.created_at ? Date.parse(a.created_at) : 0;
+      const bt = b.created_at ? Date.parse(b.created_at) : 0;
+      return bt - at;
+    });
+    log(`[*] Focus: ${todayTracks.length} of ${tracks.length} track(s) uploaded today (${today} ${tz}).`);
+    tracks = todayTracks;
+
+    const before = pool.length;
+    pool = pool.filter(a => String(a.user_id) !== String(user.id));
+    if (pool.length !== before) {
+      log(`[*] Focus: removed ${before - pool.length} account(s) matching the target from the pool.`);
+    }
+
+    if (CFG.focusMaxTracks > 0 && tracks.length > CFG.focusMaxTracks) {
+      const cap = tracks.slice(0, CFG.focusMaxTracks);
+      log(`[*] Focus: capping to ${cap.length} of ${tracks.length} today-track(s) (newest first, FOCUS_MAX_TRACKS=${CFG.focusMaxTracks}).`);
+      tracks = cap;
+    }
+
+    trackSource = `@${user.handle || focus.handle} (today)`;
+  } else {
+    let feedItems;
+    try {
+      feedItems = await fetchFeed(primary.user_id, CFG.feedLimit);
+    } catch (e) {
+      const backoff = recordFeedFailure(state);
+      await saveState(sb, ctx, state);
+      log(`[!] Feed fetch failed (attempt ${state.feed_fail_count}, retry in ${Math.round(backoff / 1000)}s): ${errMsg(e).slice(0, 60)}`);
+      return;
+    }
+    recordFeedSuccess(state);
+    tracks = extractTracks(feedItems);
+    trackSource = 'feed';
+  }
+
   if (!tracks.length) {
-    log('[*] Feed: empty.');
+    log(`[*] ${trackSource}: no tracks.`);
     await saveState(sb, ctx, state);
     return;
   }
 
-  let newTracks = [];
-  for (const t of tracks) {
-    const entry = state.fed_tracks[t.id];
-    if (!entry) { newTracks.push(t); continue; }
-    if (entry.skipped) continue;
-    const favs = (entry.favorited_by || []).length;
-    const reps = (entry.reposted_by || []).length;
-    if (favs < TARGET_INTERACTIONS || reps < TARGET_INTERACTIONS) newTracks.push(t);
+  const targetFavRep = focus ? focus.target : (CFG._feedTarget || TARGET_INTERACTIONS);
+  const skipFavRep = focus && targetFavRep === 0;
+
+  let pending = [];
+  if (!skipFavRep) {
+    for (const t of tracks) {
+      const entry = state.fed_tracks[t.id];
+      if (!entry) { pending.push(t); continue; }
+      if (entry.skipped) continue;
+      const favs = (entry.favorited_by || []).length;
+      const reps = (entry.reposted_by || []).length;
+      if (favs < targetFavRep || reps < targetFavRep) pending.push(t);
+    }
   }
 
-  const isFirstRun = FORCE_FIRST_RUN || !state.first_run_done;
+  const isFirstRun = focus ? false : (FORCE_FIRST_RUN || !state.first_run_done);
   if (isFirstRun) {
-    const sorted = [...newTracks].sort((a, b) => {
+    const sorted = [...pending].sort((a, b) => {
       const at = a.created_at ? Date.parse(a.created_at) : 0;
       const bt = b.created_at ? Date.parse(b.created_at) : 0;
       if (at && bt) return bt - at;
@@ -819,66 +1069,82 @@ async function doFeedInteract(sb, ctx, state, pool, primary) {
         skip_reason: 'first-run-backlog',
       };
     }
-    newTracks = keep;
+    pending = keep;
     state.first_run_done = true;
     log(`[*] First run: taking latest ${keep.length}, skipping ${skip.length} older track(s) from backlog.`);
   }
 
-  if (!newTracks.length) {
-    log(`[*] Feed: ${tracks.length} track(s), nothing new to interact with.`);
+  // Nothing to do for favs/reposts → still delegate comments/streams on ALL tracks.
+  if (!pending.length) {
+    log(`[*] ${trackSource}: ${tracks.length} track(s), nothing to do for fav/repost.`);
     await saveState(sb, ctx, state);
+    if (focus) {
+      const cmtStatus = await delegateComments(focus, tracks);
+      if (cmtStatus) log(`[*] Focus: comment step ${cmtStatus}.`);
+      const strStatus = await delegateStreams(focus, tracks);
+      if (strStatus) log(`[*] Focus: stream step ${strStatus}.`);
+    }
     return;
   }
 
-  const limit = isFirstRun ? Infinity : CFG.maxTracksPerRun;
-  log(`[*] Feed: ${tracks.length} tracks, ${newTracks.length} pending, processing up to ${Number.isFinite(limit) ? limit : newTracks.length} this run.`);
+  const limit = focus
+    ? Infinity
+    : (isFirstRun ? Infinity : CFG.maxTracksPerRun);
+  const actionWord = skipFavRep ? 'skipping fav/repost' : `${targetFavRep} favs + ${targetFavRep} reposts per track`;
+  log(`[*] ${trackSource}: ${tracks.length} track(s), ${pending.length} pending. Target: ${actionWord}. Processing up to ${Number.isFinite(limit) ? limit : pending.length} this run.`);
 
   let processed = 0;
-  for (const t of newTracks) {
+  for (const t of pending) {
     if (LOCK_LOST) break;
-    if (processed >= limit) break; // tracks skipped by the pre-check below do not use up the limit
+    if (processed >= limit) break;
     const titlePart = t.title ? ` "${t.title.slice(0, 40)}"` : '';
     const existing = state.fed_tracks[t.id];
 
-    // Pre-check, before the first interaction with a track. Once we have started on a track its
-    // counts include our own favorites/reposts, so tracks already in progress are not re-checked.
-    const started = existing && ((existing.favorited_by || []).length + (existing.reposted_by || []).length) > 0;
-    if (!started) {
-      let counts;
-      try {
-        counts = await fetchTrackCounts(t.id);
-      } catch (e) {
-        log(`[!] Track ${t.id}${titlePart} | could not read track details (${errMsg(e).slice(0, 60)}); not interacting now, will retry.`);
-        continue;
+    if (!focus) {
+      const started = existing && (((existing.favorited_by || []).length + (existing.reposted_by || []).length) > 0);
+      if (!started) {
+        let counts;
+        try {
+          counts = await fetchTrackCounts(t.id);
+        } catch (e) {
+          log(`[!] Track ${t.id}${titlePart} | could not read track details (${errMsg(e).slice(0, 60)}); not interacting now, will retry.`);
+          continue;
+        }
+        if (isAlreadyPopular(counts)) {
+          state.fed_tracks[t.id] = {
+            seen_at: new Date().toISOString(),
+            favorited_by: [],
+            reposted_by: [],
+            skipped: true,
+            skip_reason: 'already-popular',
+            favorite_count: counts.favs,
+            repost_count: counts.reps,
+          };
+          await saveState(sb, ctx, state);
+          log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | skipped (${CFG.skipWhen === 'either' ? 'either count' : 'both counts'} already >= ${CFG.skipAtCount}).`);
+          continue;
+        }
+        if (VERBOSE) log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | below ${CFG.skipAtCount}, interacting.`);
       }
-      if (isAlreadyPopular(counts)) {
-        state.fed_tracks[t.id] = {
-          seen_at: new Date().toISOString(),
-          favorited_by: [],
-          reposted_by: [],
-          skipped: true,
-          skip_reason: 'already-popular',
-          favorite_count: counts.favs,
-          repost_count: counts.reps,
-        };
-        await saveState(sb, ctx, state);
-        log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | skipped (${CFG.skipWhen === 'either' ? 'either count' : 'both counts'} already >= ${CFG.skipAtCount}).`);
-        continue;
-      }
-      if (VERBOSE) log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | below ${CFG.skipAtCount}, interacting.`);
     }
 
     processed++;
     if (!state.fed_tracks[t.id]) {
-      state.fed_tracks[t.id] = { seen_at: new Date().toISOString(), favorited_by: [], reposted_by: [] };
+      state.fed_tracks[t.id] = {
+        seen_at: new Date().toISOString(),
+        favorited_by: [],
+        reposted_by: [],
+        title: t.title || '',
+      };
     }
     const entry = state.fed_tracks[t.id];
+    if (!entry.title && t.title) entry.title = t.title;
 
-    const favResult = await interactTrackKind(state, t.id, 'favorited_by', pool, TARGET_INTERACTIONS);
+    const favResult = await interactTrackKind(state, t.id, 'favorited_by', pool, targetFavRep);
     await saveState(sb, ctx, state);
     if (!favResult.done && favResult.reason === 'lock-lost') break;
 
-    const repResult = await interactTrackKind(state, t.id, 'reposted_by', pool, TARGET_INTERACTIONS);
+    const repResult = await interactTrackKind(state, t.id, 'reposted_by', pool, targetFavRep);
     await saveState(sb, ctx, state);
     if (!repResult.done && repResult.reason === 'lock-lost') break;
 
@@ -886,14 +1152,43 @@ async function doFeedInteract(sb, ctx, state, pool, primary) {
     if (!favResult.done) tags.push(`fav:${favResult.reason}`);
     if (!repResult.done) tags.push(`rep:${repResult.reason}`);
     const suffix = tags.length ? ` (${tags.join(', ')})` : '';
-    log(`[*] Track ${t.id}${titlePart} | FAV ${entry.favorited_by.length}/${TARGET_INTERACTIONS} | REP ${entry.reposted_by.length}/${TARGET_INTERACTIONS}${suffix}`);
+    log(`[*] Track ${t.id}${titlePart} | FAV ${(entry.favorited_by || []).length}/${targetFavRep} | REP ${(entry.reposted_by || []).length}/${targetFavRep}${suffix}`);
 
     if (CFG.actionDelayMs) await sleep(CFG.actionDelayMs);
+  }
+
+  if (focus) {
+    if (LOCK_LOST) {
+      log('[!] Focus: tastemaker lock lost; skipping comment/stream delegation.');
+    } else {
+      const forDelegation = processed > 0 ? pending.slice(0, processed) : tracks;
+      if (!forDelegation.length) {
+        log('[*] Focus: no tracks to delegate this run.');
+      } else {
+        log(`[*] Focus: handing ${forDelegation.length} track(s) to comment.js (target ${focus.commentTarget} per track).`);
+        const cmtStatus = await delegateComments(focus, forDelegation);
+        if (cmtStatus === 'LOCKED') {
+          log('[!] Focus: comment lock held by another run; skipping comment step this cycle.');
+        } else if (cmtStatus) {
+          log(`[*] Focus: comment step ${cmtStatus}.`);
+        }
+
+        if (focus.streamTarget > 0) {
+          log(`[*] Focus: handing ${forDelegation.length} track(s) to stream.js (target ${focus.streamTarget} streams per track).`);
+          const strStatus = await delegateStreams(focus, forDelegation);
+          if (strStatus === 'LOCKED') {
+            log('[!] Focus: stream lock held by another run; skipping stream step this cycle.');
+          } else if (strStatus) {
+            log(`[*] Focus: stream step ${strStatus}.`);
+          }
+        }
+      }
+    }
   }
 }
 
 // ============ MAIN ============
-async function runTastemaker({ now = new Date() } = {}) {
+async function runTastemaker({ now = new Date(), focus = null } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
 
@@ -919,11 +1214,13 @@ async function runTastemaker({ now = new Date() } = {}) {
     }
     const pool = [primary, ...shuffle(helpers)];
     const availableNow = pool.filter(a => !isOnCooldown(state, a.address)).length;
-    log(`[*] Pool: ${pool.length} accounts (${availableNow} available, ${pool.length - availableNow} cooling down). Target ${TARGET_INTERACTIONS} interactions per track per action.`);
+    log(`[*] Pool: ${pool.length} accounts (${availableNow} available, ${pool.length - availableNow} cooling down).`);
 
     pruneFedTracks(state);
 
-    if (isTrendingDue(state)) {
+    if (focus) {
+      log('[*] Focus mode: skipping trending follow.');
+    } else if (isTrendingDue(state)) {
       log(`[*] Trending follow cycle due (last: ${state.last_trend_check || 'never'}).`);
       try {
         await doTrendingFollow(sb, ctx, state, primary);
@@ -937,11 +1234,11 @@ async function runTastemaker({ now = new Date() } = {}) {
 
     if (LOCK_LOST) throw LOCK_LOST;
 
-    if (shouldSkipFeed(state)) {
+    if (!focus && shouldSkipFeed(state)) {
       const remain = Math.round((Date.parse(state.feed_retry_at) - Date.now()) / 1000);
       log(`[*] Feed backoff active (${remain}s remaining, ${state.feed_fail_count} consecutive failures). Skipping feed.`);
     } else {
-      await doFeedInteract(sb, ctx, state, pool, primary);
+      await doFeedInteract(sb, ctx, state, pool, primary, focus);
     }
 
     await saveState(sb, ctx, state);
@@ -978,8 +1275,21 @@ async function sleepInterruptible(ms) {
   }
 }
 
-async function loopForever() {
+async function loopForever(focus) {
   installSignalHandlers();
+
+  if (focus) {
+    log('[*] Focus mode: running a single cycle then exiting.');
+    try {
+      await runTastemaker({ focus });
+    } catch (e) {
+      if (e instanceof LockLostError) log('[!] Lock lost.');
+      else log(`[!] Focus cycle failed: ${errMsg(e).slice(0, 100)}`);
+      process.exit(1);
+    }
+    return;
+  }
+
   const waitSec = Math.round(CFG.loopIntervalMs / 1000);
   log(`[*] Loop mode active (interval ${waitSec}s). Press Ctrl+C to stop.`);
 
@@ -1007,19 +1317,41 @@ async function loopForever() {
 
 // ============ ENTRY ============
 if (require.main === module) {
+  const focus = parseCliFocus();
+
   if (ONCE) {
-    runTastemaker()
+    runTastemaker({ focus })
       .then(() => process.exit(0))
       .catch(err => {
         console.error('[!] Fatal error:', err.message || err);
         process.exit(1);
       });
+  } else if (focus) {
+    loopForever(focus).catch(err => {
+      console.error('[!] Fatal error:', err.message || err);
+      process.exit(1);
+    });
   } else {
-    loopForever().catch(err => {
+    loopForever(null).catch(err => {
       console.error('[!] Fatal error:', err.message || err);
       process.exit(1);
     });
   }
 }
 
-module.exports = { runTastemaker, buildContext, CFG, TARGET_INTERACTIONS, fetchTrackCounts, isAlreadyPopular, doFeedInteract };
+module.exports = {
+  runTastemaker,
+  buildContext,
+  CFG,
+  TARGET_INTERACTIONS,
+  fetchTrackCounts,
+  isAlreadyPopular,
+  doFeedInteract,
+  fetchUserByHandle,
+  fetchUserTracks,
+  parseCliFocus,
+  parseCount,
+  delegateComments,
+  delegateStreams,
+  ymdInTz,
+};

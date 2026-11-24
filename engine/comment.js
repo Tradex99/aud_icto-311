@@ -22,7 +22,10 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     const pool = up.length ? up : PROXY_URLS;
     return pool[Math.floor(Math.random() * pool.length)];
   };
-  console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+  if (!global.__AUDIUS_PROXY_LOGGED) {
+    console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
+    global.__AUDIUS_PROXY_LOGGED = true;
+  }
   globalThis.fetch = async (input, init) => {
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
@@ -91,6 +94,13 @@ const DB_FILE = path.join(ROOT_DIR, 'db.txt');
 const STATE_FILE = path.join(ROOT_DIR, '.audius_comment_state.json');
 const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
+// Custom (tastemaker-triggered) runs use run numbers in this range so they never collide
+// with scheduled daily runs (1..CFG.runsPerDay).
+const CUSTOM_RUN_START = 100;
+const CUSTOM_RUN_END = 200;
+
+const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
+
 const CFG = {
   timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
   resetHour: Number(process.env.RESET_HOUR ?? 12),
@@ -114,7 +124,7 @@ const CFG = {
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
 };
 
-const attemptsPerRun = cap => Math.ceil(cap / CFG.runsPerDay);
+const attemptsPerRun = (cap, custom) => custom ? cap : Math.ceil(cap / CFG.runsPerDay);
 
 const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 
@@ -235,9 +245,7 @@ async function readUpTracks(sb) {
   return data && data[0] ? data[0].up_tracks : null;
 }
 
-// Only the LAST published batch counts: the newest date in up_tracks that has at least one
-// successful upload. Earlier days are ignored completely, and the same tracks stay the
-// targets until upload_track.js publishes a newer batch.
+// Only the LAST published batch counts.
 function collectTracks(upTracks) {
   const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
   const ok = days.filter(d => d && d.status === 'success' && d.track_id != null && typeof d.date === 'string' &&
@@ -258,6 +266,63 @@ function collectTracks(upTracks) {
   return [...seen.values()];
 }
 
+// ============ NEW: user lookup / track fetching for handle= mode ============
+async function audiusGet(pathname, what, timeoutMs = CFG.callTimeoutMs) {
+  const url = `https://api.audius.co${pathname}`;
+  let lastErr;
+  for (let i = 1; i <= CFG.retries; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
+      if (!res.ok) {
+        if (res.status === 429 || res.status >= 500) {
+          lastErr = Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+          await sleep(3000 * i);
+          continue;
+        }
+        throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+      }
+      const data = await res.json();
+      return (data && data.data) || [];
+    } catch (e) {
+      lastErr = e;
+      const isAbort = controller.signal.aborted || /abort/i.test(String(e.message || ''));
+      if (isAbort) lastErr = new Error(`timeout after ${timeoutMs / 1000}s`);
+      if (i < CFG.retries) await sleep(1000 * i);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr || new Error(`${what} failed`);
+}
+
+async function fetchUserByHandle(handle) {
+  const data = await audiusGet(`/v1/users/handle/${encodeURIComponent(handle)}?app_name=comment`, 'user lookup', CFG.callTimeoutMs);
+  const user = Array.isArray(data) ? data[0] : data;
+  if (!user || !user.id) throw new Error(`user not found: @${handle}`);
+  return user;
+}
+
+async function fetchUserTracks(userId) {
+  const out = [];
+  const seen = new Set();
+  const page = 100;
+  for (let offset = 0; offset < 1000; offset += page) {
+    const data = await audiusGet(`/v1/users/${encodeURIComponent(userId)}/tracks?limit=${page}&offset=${offset}&sort=date&app_name=comment`, 'user tracks', CFG.callTimeoutMs);
+    const list = Array.isArray(data) ? data : [];
+    for (const t of list) {
+      const id = String(t.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({ id, title: t.title || '', created_at: t.created_at || t.release_date || null });
+    }
+    if (list.length < page) break;
+  }
+  return out;
+}
+
+// ============ STATE ============
 function sameWeek(raw, weekStart) {
   if (!isObj(raw)) return false;
   if (raw.week_start === weekStart) return true;
@@ -648,6 +713,15 @@ function dayState(coord, today) {
   return null;
 }
 
+// Find the next free custom run number (100..199) for today.
+function nextCustomRunNumber(coord, today) {
+  for (let n = CUSTOM_RUN_START; n < CUSTOM_RUN_END; n++) {
+    const b = (coord.batches || []).find(x => x.date === today && x.run_number === n);
+    if (!b || !b.done) return { runNumber: n, batch: b || null };
+  }
+  return null;
+}
+
 function reason(e) {
   if (isRateLimit(e)) return '429';
   const code = statusOf(e);
@@ -779,7 +853,9 @@ function countTracks(rows, ctx, runNumber) {
   return counts;
 }
 
-async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
+// MODIFIED: accepts `custom` and `excludeUser`. For custom runs, `attempts`/`maxOk` are
+// derived from this run's own contribution only (independent of the scheduled daily cap).
+async function processRun(sb, ctx, rows, targets, { runNumber, batch, custom = false, excludeUser = null }) {
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
     user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r), commented: commentedSet(r.comment, ctx.weekStart),
@@ -815,8 +891,14 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   const todayDone = countTracks(rows, ctx);
   const runDone = countTracks(rows, ctx, runNumber);
   const need = new Map(targets.map(t => {
+    const thisRunDone = runDone.get(t.key) || 0;
+    if (custom) {
+      // Custom run: do up to `t.cap` (== target) in THIS run, independent of other runs today.
+      const remaining = Math.max(0, t.cap - thisRunDone);
+      return [t.key, { attempts: remaining, maxOk: remaining }];
+    }
     const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
-    const attempts = Math.max(0, attemptsPerRun(t.cap) - (runDone.get(t.key) || 0));
+    const attempts = Math.max(0, attemptsPerRun(t.cap, false) - thisRunDone);
     return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
   }));
   let totalNeed = 0;
@@ -828,7 +910,7 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     active++;
   }
   if (!totalNeed) {
-    if (!tracksBelowCap(rows, targets, ctx).length) {
+    if (!custom && !tracksBelowCap(rows, targets, ctx).length) {
       log(allDoneMsg(targets.length));
       return { status: 'ALREADY_COMPLETED' };
     }
@@ -842,8 +924,8 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
     return { status: 'COMPLETED' };
   }
-  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} comments.`);
+  const atCap = custom ? 0 : targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
+  log(`[*] ${custom ? 'Custom' : ''} run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} comments.`);
 
   if (!batch) {
     await updateComment(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -862,15 +944,17 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
     const n = need.get(t.key);
     if (!n.attempts) continue;
     if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.qualified && !a.commented.has(t.key) && !run.cool.has(a.address));
+    const pool = accounts.filter(a => a.qualified && !a.commented.has(t.key) && !run.cool.has(a.address) &&
+      (!excludeUser || String(a.user_id) !== String(excludeUser)));
     const candidates = shuffle(pool).sort((x, y) => x.today - y.today);
     const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
     if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
     const day = (todayDone.get(t.key) || 0) + got;
+    const inRun = (runDone.get(t.key) || 0) + got;
     if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id} | ${day}/${t.cap} today (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
+      log(`[!] track ${t.id} | ${custom ? `${inRun}/${t.cap} this run` : `${day}/${t.cap} today`} (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
     } else {
-      log(`[*] track ${t.id} | ${day}/${t.cap} today${day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] track ${t.id} | ${custom ? `${inRun}/${t.cap} this run` : `${day}/${t.cap} today`}${custom ? '' : day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
     if (run.stop) incomplete = true;
   }
@@ -889,10 +973,11 @@ async function processRun(sb, ctx, rows, targets, { runNumber, batch }) {
   if (st.rate) parts.push(`${st.rate} rate-limited`);
   if (st.retry) parts.push(`${st.retry} errors`);
   if (st.perm) parts.push(`${st.perm} failed`);
-  log(`[*] Run ${runNumber} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
+  log(`[*] ${custom ? 'Custom' : ''} run ${runNumber} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
   return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
 }
 
+// Scheduled entry point (unchanged behavior).
 async function runComment({ now = new Date() } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
@@ -946,6 +1031,135 @@ async function runComment({ now = new Date() } = {}) {
   }
 }
 
+// ============ NEW: runComments (tastemaker integration) ============
+// Called from tastemaker.js with a specific handle and target. Reuses all comment machinery
+// but uses a custom run number (100..199) so it never interferes with the scheduled runs.
+//
+//   runComments({ handle: 'illpetill', target: 50 })
+//   runComments({ tracks: [{ id, title }], target: 50 })
+//   runComments({ handle: 'illpetill', tracks: [...], target: 50 })
+//
+// Semantics: "do up to `target` comments on each track in THIS invocation". Running twice
+// does `target` more (a new custom run number is allocated), unless the pool is exhausted.
+async function runComments({ handle = null, tracks = null, target, now = new Date() } = {}) {
+  if (!Number.isInteger(target) || target <= 0) {
+    throw new Error(`runComments: target must be a positive integer (got ${target})`);
+  }
+  if (!tracks && !handle) {
+    throw new Error('runComments: either tracks or handle is required');
+  }
+
+  const ctx = buildContext(now);
+  const sb = connectSupabase();
+  PENDING = loadPending();
+
+  let rows = await fetchRows(sb);
+  const reader = rows.find(r => hasCreds(r));
+  if (!reader) throw new Error('runComments: no account with complete credentials');
+
+  let focusUserId = null;
+  let focusHandle = null;
+  let focusTracks;
+
+  if (handle) {
+    const sdk = makeSdk(reader);
+    let user = null;
+    try {
+      const res = await readRetry(() => sdk.users.getUserByHandle({ handle }));
+      user = res && res.data;
+    } catch (e) {
+      if (isRateLimit(e)) throw e;
+    }
+    if (!user) {
+      try { user = await fetchUserByHandle(handle); } catch (e) { throw new Error(`runComments: user not found: @${handle} (${errMsg(e)})`); }
+    }
+    if (!user || !user.id) throw new Error(`runComments: user not found: @${handle}`);
+    focusUserId = String(user.id);
+    focusHandle = user.handle || handle;
+  }
+
+  if (tracks && tracks.length) {
+    focusTracks = tracks.map(t => ({
+      id: String(t.id),
+      key: String(t.id),
+      address: t.address || null,
+      handle: t.handle || focusHandle,
+      title: (t.title || '').toString().trim().slice(0, 80) || null,
+      date: ctx.today,
+      cap: target,
+    }));
+  } else if (focusUserId) {
+    let list;
+    try {
+      list = await fetchUserTracks(focusUserId);
+    } catch (e) {
+      throw new Error(`runComments: could not fetch tracks for @${focusHandle || handle}: ${errMsg(e)}`);
+    }
+    focusTracks = list.map(t => ({
+      id: String(t.id),
+      key: String(t.id),
+      address: null,
+      handle: focusHandle || handle,
+      title: (t.title || '').toString().trim().slice(0, 80) || null,
+      date: ctx.today,
+      cap: target,
+    }));
+  } else {
+    throw new Error('runComments: could not resolve tracks');
+  }
+
+  // Deduplicate by id.
+  const seen = new Set();
+  focusTracks = focusTracks.filter(t => (seen.has(t.key) ? false : (seen.add(t.key), true)));
+
+  if (!focusTracks.length) {
+    log('[!] runComments: no tracks to comment on.');
+    return { status: 'NO_TARGETS' };
+  }
+
+  log(`[*] runComments: ${focusTracks.length} track(s), target ${target} per track${focusHandle ? ` (focus @${focusHandle})` : ''}.`);
+
+  const lock = await acquireLock(sb, ctx);
+  if (!lock) return { status: 'LOCKED' };
+  HELD_LOCK = lock;
+  LOCK_LOST = null;
+  const stopHeartbeat = startHeartbeat(sb, ctx);
+
+  try {
+    await flushPending(sb, ctx);
+    rows = await fetchRows(sb);
+
+    const coord = normalizeComment(rows.find(r => r.address === TARGET_ADDRESS).comment, ctx.weekStart);
+    const slot = nextCustomRunNumber(coord, ctx.today);
+    if (!slot) {
+      log('[*] runComments: no free custom run slot today (100..199 all used).');
+      return { status: 'ALREADY_COMPLETED' };
+    }
+
+    // Quick check: is any track below target within this run slot?
+    const runDone = countTracks(rows, ctx, slot.runNumber);
+    let anyNeed = false;
+    for (const t of focusTracks) {
+      if ((runDone.get(t.key) || 0) < target) { anyNeed = true; break; }
+    }
+    if (!anyNeed) {
+      log(`[*] runComments: all tracks already at target ${target} in run ${slot.runNumber}.`);
+      return { status: 'ALREADY_COMPLETED' };
+    }
+
+    return await processRun(sb, ctx, rows, focusTracks, {
+      runNumber: slot.runNumber,
+      batch: slot.batch,
+      custom: true,
+      excludeUser: focusUserId,
+    });
+  } finally {
+    stopHeartbeat();
+    HELD_LOCK = null;
+    await releaseLock(sb, ctx, lock);
+  }
+}
+
 if (require.main === module) {
   runComment().catch(err => {
     console.error('[!] Fatal error:', err.message || err);
@@ -953,4 +1167,12 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runComment, collectTracks, buildContext, CFG };
+module.exports = {
+  runComment,
+  runComments,
+  collectTracks,
+  buildContext,
+  CFG,
+  fetchUserByHandle,
+  fetchUserTracks,
+};
