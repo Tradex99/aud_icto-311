@@ -164,11 +164,14 @@ const CFG = {
   loopIntervalMs: Number(process.env.LOOP_INTERVAL_SECONDS || 60) * 1000,
   feedBackoffBaseMs: Number(process.env.FEED_BACKOFF_BASE_MS || 10000),
   feedBackoffMaxMs: Number(process.env.FEED_BACKOFF_MAX_MS || 60000),
+<<<<<<< HEAD
   skipAtCount: Number(process.env.SKIP_AT_COUNT || 5),
   skipWhen: /^either$/i.test(process.env.SKIP_WHEN || '') ? 'either' : 'both',
   commentsPerTrack: Number(process.env.COMMENTS_PER_TRACK || DEFAULT_COMMENTS_PER_TRACK),
   focusMaxTracks: Number(process.env.FOCUS_MAX_TRACKS || 0),
   _feedTarget: null,
+=======
+>>>>>>> 4dd8ce1 (Add files via upload)
 };
 
 // ============ CLI ARGS ============
@@ -776,6 +779,7 @@ function pruneFedTracks(state) {
   state.fed_tracks = Object.fromEntries(kept);
 }
 
+<<<<<<< HEAD
 // ============ TRACK DETAILS PRE-CHECK (feed mode only) ============
 async function fetchTrackCounts(trackId) {
   const data = await audiusGet(`/v1/tracks/${encodeURIComponent(trackId)}?app_name=tastemaker`, 'track details', CFG.callTimeoutMs);
@@ -793,6 +797,8 @@ function isAlreadyPopular({ favs, reps }) {
 }
 
 // ============ INTERACTIONS (favs + reposts only) ============
+=======
+>>>>>>> 4dd8ce1 (Add files via upload)
 async function interactTask(state, trackId, kind, acct) {
   const entry = state.fed_tracks[trackId];
   if (!entry) return { status: 'skip' };
@@ -1087,6 +1093,7 @@ async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
     return;
   }
 
+<<<<<<< HEAD
   const limit = focus
     ? Infinity
     : (isFirstRun ? Infinity : CFG.maxTracksPerRun);
@@ -1129,6 +1136,13 @@ async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
     }
 
     processed++;
+=======
+  const toProcess = isFirstRun ? newTracks : newTracks.slice(0, CFG.maxTracksPerRun);
+  log(`[*] Feed: ${tracks.length} tracks, ${newTracks.length} pending, processing ${toProcess.length} this run.`);
+
+  for (const t of toProcess) {
+    if (LOCK_LOST) break;
+>>>>>>> 4dd8ce1 (Add files via upload)
     if (!state.fed_tracks[t.id]) {
       state.fed_tracks[t.id] = {
         seen_at: new Date().toISOString(),
@@ -1152,7 +1166,12 @@ async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
     if (!favResult.done) tags.push(`fav:${favResult.reason}`);
     if (!repResult.done) tags.push(`rep:${repResult.reason}`);
     const suffix = tags.length ? ` (${tags.join(', ')})` : '';
+<<<<<<< HEAD
     log(`[*] Track ${t.id}${titlePart} | FAV ${(entry.favorited_by || []).length}/${targetFavRep} | REP ${(entry.reposted_by || []).length}/${targetFavRep}${suffix}`);
+=======
+    const titlePart = t.title ? ` "${t.title.slice(0, 40)}"` : '';
+    log(`[*] Track ${t.id}${titlePart} | FAV ${entry.favorited_by.length}/${TARGET_INTERACTIONS} | REP ${entry.reposted_by.length}/${TARGET_INTERACTIONS}${suffix}`);
+>>>>>>> 4dd8ce1 (Add files via upload)
 
     if (CFG.actionDelayMs) await sleep(CFG.actionDelayMs);
   }
@@ -1339,6 +1358,7 @@ if (require.main === module) {
   }
 }
 
+<<<<<<< HEAD
 module.exports = {
   runTastemaker,
   buildContext,
@@ -1355,3 +1375,6 @@ module.exports = {
   delegateStreams,
   ymdInTz,
 };
+=======
+module.exports = { runTastemaker, buildContext, CFG, TARGET_INTERACTIONS };
+>>>>>>> 4dd8ce1 (Add files via upload)
