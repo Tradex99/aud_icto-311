@@ -114,6 +114,11 @@ const CFG = {
 
 const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
 
+// Custom (follow= / target=) runs use run numbers in this range so they never
+// collide with scheduled daily runs (1..CFG.runsPerDay).
+const CUSTOM_RUN_START = 100;
+const CUSTOM_RUN_END = 200;
+
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
 const statusOf = e => e && ((e.response && e.response.status) || e.status);
@@ -126,6 +131,17 @@ function shuffle(arr) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+// NEW: parse `target=N` — must be a positive integer.
+function parseTarget(spec) {
+  if (spec === null || spec === undefined || spec === '') return null;
+  const n = Number(spec);
+  if (!Number.isInteger(n) || n <= 0) {
+    log(`[!] Ignoring invalid target=${spec} (must be a positive integer).`);
+    return null;
+  }
+  return n;
 }
 
 function isRateLimit(e) {
@@ -248,6 +264,24 @@ function latestHandles(upTracks) {
     seen.set(h.toLowerCase(), { handle: h, address: d.address || null, date: latest });
   }
   return [...seen.values()];
+}
+
+// Parse a `follow=handle1,handle2,...` specification into published-shape entries.
+function customHandles(spec, ctx) {
+  const parsed = String(spec || '').split(',').map(s => s.trim().replace(/^@/, '')).filter(Boolean);
+  if (!parsed.length) return [];
+  const valid = [];
+  const invalid = [];
+  const seen = new Set();
+  for (const h of parsed) {
+    if (!HANDLE_RE.test(h)) { invalid.push(h); continue; }
+    const k = h.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    valid.push({ handle: h, address: null, date: ctx.today });
+  }
+  if (invalid.length) log(`[!] Ignoring invalid handle(s): ${invalid.join(', ')}`);
+  return valid;
 }
 
 function sameWeek(raw, weekStart) {
@@ -455,17 +489,21 @@ async function verifyFollow(sdk, followerId, targetId) {
   return false;
 }
 
-function handlesBelowCap(rows, published, ctx) {
+// MODIFIED: cap is now a parameter (defaults to CFG.dailyPerHandle).
+function handlesBelowCap(rows, published, ctx, cap = CFG.dailyPerHandle) {
   const today = countHandles(rows, ctx);
-  return published.filter(p => (today.get(p.handle.toLowerCase()) || 0) < CFG.dailyPerHandle);
+  return published.filter(p => (today.get(p.handle.toLowerCase()) || 0) < cap);
 }
 
-function allDoneMsg(n) {
-  return `[*] All ${n} handles reached ${CFG.dailyPerHandle} followers today. Exiting.`;
+// MODIFIED: cap is now a parameter.
+function allDoneMsg(n, cap = CFG.dailyPerHandle) {
+  return `[*] All ${n} handles reached ${cap} followers today. Exiting.`;
 }
 
-function dayState(coord, today) {
-  for (let n = 1; n <= CFG.runsPerDay; n++) {
+function dayState(coord, today, custom = false) {
+  const start = custom ? CUSTOM_RUN_START : 1;
+  const end = custom ? CUSTOM_RUN_END : CFG.runsPerDay + 1;
+  for (let n = start; n < end; n++) {
     const b = (coord.batches || []).find(x => x.date === today && x.run_number === n);
     if (!b || !b.done) return { runNumber: n, batch: b || null };
   }
@@ -607,7 +645,11 @@ function countHandles(rows, ctx, runNumber) {
   return counts;
 }
 
-async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
+// MODIFIED: accepts dailyCap and perRunCap (driven by target=).
+async function processRun(sb, ctx, rows, published, { runNumber, batch, isCustom = false, dailyCap = CFG.dailyPerHandle, perRunCap = CFG.accountsPerRun }) {
+  const isCustomRun = isCustom || runNumber >= CUSTOM_RUN_START;
+  const runLabel = isCustomRun ? `Custom run ${runNumber}` : `Run ${runNumber}`;
+
   const accounts = rows.map(r => ({
     address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
     user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r), followed: followedSet(r.follower, ctx.weekStart),
@@ -621,21 +663,21 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
 
   const todayDone = countHandles(rows, ctx);
   const runDone = countHandles(rows, ctx, runNumber);
-  const lastRun = runNumber >= CFG.runsPerDay;
+  const lastRun = !isCustomRun && runNumber >= CFG.runsPerDay;
   const need = new Map(targets.map(t => {
-    const left = Math.max(0, CFG.dailyPerHandle - (todayDone.get(t.key) || 0));
-    const perRun = lastRun ? left : Math.min(left, Math.max(0, CFG.accountsPerRun - (runDone.get(t.key) || 0)));
+    const left = Math.max(0, dailyCap - (todayDone.get(t.key) || 0));
+    const perRun = lastRun ? left : Math.min(left, Math.max(0, perRunCap - (runDone.get(t.key) || 0)));
     return [t.key, perRun];
   }));
   let totalNeed = 0;
   let active = 0;
   for (const n of need.values()) { totalNeed += n; if (n) active++; }
   if (!totalNeed && !unresolved) {
-    log(allDoneMsg(targets.length));
+    log(allDoneMsg(targets.length, dailyCap));
     return { status: 'ALREADY_COMPLETED' };
   }
-  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= CFG.dailyPerHandle).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} handles to do${atCap ? ` (${atCap} already at ${CFG.dailyPerHandle})` : ''}, ${totalNeed} follows.`);
+  const atCap = targets.filter(t => (todayDone.get(t.key) || 0) >= dailyCap).length;
+  log(`[*] ${runLabel}${batch ? ' (resumed)' : ''}: ${active} handles to do${atCap ? ` (${atCap} already at ${dailyCap})` : ''}, ${totalNeed} follows.`);
 
   if (!batch) {
     await updateFollower(sb, TARGET_ADDRESS, ctx.weekStart, h => {
@@ -661,9 +703,9 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
     const day = (todayDone.get(t.key) || 0) + got;
     if (got < want) {
       if (transient || run.stop) incomplete = true;
-      log(`[!] @${t.handle} | ${day}/${CFG.dailyPerHandle} today${transient || run.stop ? '' : ' (no more accounts available)'}`);
+      log(`[!] @${t.handle} | ${day}/${dailyCap} today${transient || run.stop ? '' : ' (no more accounts available)'}`);
     } else {
-      log(`[*] @${t.handle} | ${day}/${CFG.dailyPerHandle} today${day >= CFG.dailyPerHandle ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
+      log(`[*] @${t.handle} | ${day}/${dailyCap} today${day >= dailyCap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
     }
   }
 
@@ -682,33 +724,53 @@ async function processRun(sb, ctx, rows, published, { runNumber, batch }) {
   if (st.retry) parts.push(`${st.retry} errors`);
   if (st.perm) parts.push(`${st.perm} failed`);
   if (unresolved) parts.push(`${unresolved} handle(s) unresolved`);
-  log(`[*] Run ${runNumber} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
+  log(`[*] ${runLabel} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
   return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
 }
 
-async function runFollower({ now = new Date() } = {}) {
+// MODIFIED: accepts `{ follow, target }`. `follow` selects custom handles; `target` overrides
+// the per-handle daily cap AND the per-run cap.
+async function runFollower({ now = new Date(), follow = null, target = null } = {}) {
   const ctx = buildContext(now);
   const sb = connectSupabase();
   PENDING = loadPending();
 
-  const published = latestHandles(await readUpTracks(sb));
-  if (!published.length) {
-    log('[!] No successfully published handles found in up_tracks. Exiting.');
-    return { status: 'NO_TARGETS' };
+  const dailyCap = target || CFG.dailyPerHandle;
+  const perRunCap = target || CFG.accountsPerRun;
+  const isCustom = !!(follow || target);
+
+  if (target) {
+    log(`[*] Custom target: up to ${target} follows per handle (per-run cap ${perRunCap}, daily cap ${dailyCap}).`);
   }
-  log(`[*] Targeting the last published batch (${published[0].date}): ${published.length} handle(s).`);
+
+  let published;
+  if (follow) {
+    published = customHandles(follow, ctx);
+    if (!published.length) {
+      log('[!] No valid handles provided for follow=. Exiting.');
+      return { status: 'NO_TARGETS' };
+    }
+    log(`[*] Custom follow target(s): ${published.map(t => '@' + t.handle).join(', ')}`);
+  } else {
+    published = latestHandles(await readUpTracks(sb));
+    if (!published.length) {
+      log('[!] No successfully published handles found in up_tracks. Exiting.');
+      return { status: 'NO_TARGETS' };
+    }
+    log(`[*] Targeting the last published batch (${published[0].date}): ${published.length} handle(s).`);
+  }
 
   let rows = await fetchRows(sb);
   const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).follower;
   if (isObj(coordRaw) && coordRaw.week_start && !sameWeek(coordRaw, ctx.weekStart)) {
     log('[*] New week: history reset.');
   }
-  if (!handlesBelowCap(rows, published, ctx).length) {
-    log(allDoneMsg(published.length));
+  if (!handlesBelowCap(rows, published, ctx, dailyCap).length) {
+    log(allDoneMsg(published.length, dailyCap));
     return { status: 'ALREADY_COMPLETED' };
   }
-  if (!dayState(normalizeFollower(coordRaw, ctx.weekStart), ctx.today)) {
-    log('[*] Both runs already done today. Exiting.');
+  if (!dayState(normalizeFollower(coordRaw, ctx.weekStart), ctx.today, isCustom)) {
+    log(isCustom ? '[*] No custom follow slots left today. Exiting.' : '[*] Both runs already done today. Exiting.');
     return { status: 'ALREADY_COMPLETED' };
   }
 
@@ -722,16 +784,16 @@ async function runFollower({ now = new Date() } = {}) {
     await flushPending(sb, ctx);
     rows = await fetchRows(sb);
     const coord = normalizeFollower(rows.find(r => r.address === TARGET_ADDRESS).follower, ctx.weekStart);
-    if (!handlesBelowCap(rows, published, ctx).length) {
-      log(allDoneMsg(published.length));
+    if (!handlesBelowCap(rows, published, ctx, dailyCap).length) {
+      log(allDoneMsg(published.length, dailyCap));
       return { status: 'ALREADY_COMPLETED' };
     }
-    const state = dayState(coord, ctx.today);
+    const state = dayState(coord, ctx.today, isCustom);
     if (!state) {
-      log('[*] Both runs already done today. Exiting.');
+      log(isCustom ? '[*] No custom follow slots left today. Exiting.' : '[*] Both runs already done today. Exiting.');
       return { status: 'ALREADY_COMPLETED' };
     }
-    return await processRun(sb, ctx, rows, published, state);
+    return await processRun(sb, ctx, rows, published, { ...state, isCustom, dailyCap, perRunCap });
   } finally {
     stopHeartbeat();
     HELD_LOCK = null;
@@ -974,11 +1036,21 @@ async function runList() {
 const MODE_ARG = process.argv.slice(2).find(a => /^id=/.test(a));
 
 if (require.main === module) {
+  const followArg = process.argv.slice(2).find(a => /^follow=/.test(a));
+  const targetArg = process.argv.slice(2).find(a => /^target=/.test(a));
+  const follow = followArg ? followArg.slice('follow='.length) : null;
+  const target = targetArg ? parseTarget(targetArg.slice('target='.length)) : null;
+
   let task;
-  if (!MODE_ARG) task = runFollower();
-  else if (MODE_ARG === 'id=2') task = runBoost();
-  else if (MODE_ARG === 'id=3') task = runList().then(() => process.exit(0));
-  else {
+  if (!MODE_ARG) {
+    task = runFollower({ follow, target });
+  } else if (MODE_ARG === 'id=2') {
+    if (follow || target) console.error('[!] follow= and target= are only supported in default mode (no id=). Ignoring for id=2.');
+    task = runBoost();
+  } else if (MODE_ARG === 'id=3') {
+    if (follow || target) console.error('[!] follow= and target= are only supported in default mode (no id=). Ignoring for id=3.');
+    task = runList().then(() => process.exit(0));
+  } else {
     console.error(`[!] Unknown mode "${MODE_ARG}". Use no argument, id=2 or id=3.`);
     process.exit(1);
   }
@@ -988,4 +1060,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, CFG };
+module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, customHandles, parseTarget, CFG };
