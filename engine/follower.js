@@ -1060,4 +1060,8 @@ if (require.main === module) {
   });
 }
 
+<<<<<<< HEAD
 module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, customHandles, parseTarget, CFG };
+=======
+module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, customHandles, parseTarget, CFG };
+>>>>>>> b84497c (Add files via upload)
