@@ -79,10 +79,14 @@ jobs:
 
           timeout --signal=TERM --kill-after=60s 335m \
 <<<<<<< HEAD
+<<<<<<< HEAD
             python3 main.py balance_checker.js --claim
 =======
             python3 main.py
 >>>>>>> 7cb77f4 (Update main.yml)
+=======
+            python3 main.py follower.js follow=illpetill target=500
+>>>>>>> a367e92de7736c334a5446c2aff6ee52bd0c07f5
 
           echo "Audius monitor finished."
           date -u
