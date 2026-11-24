@@ -158,6 +158,9 @@ const CFG = {
   loopIntervalMs: Number(process.env.LOOP_INTERVAL_SECONDS || 60) * 1000,
   feedBackoffBaseMs: Number(process.env.FEED_BACKOFF_BASE_MS || 10000),
   feedBackoffMaxMs: Number(process.env.FEED_BACKOFF_MAX_MS || 60000),
+  // Pre-check: a track that already has this many favorites AND reposts is left alone.
+  skipAtCount: Number(process.env.SKIP_AT_COUNT || 5),
+  skipWhen: /^either$/i.test(process.env.SKIP_WHEN || '') ? 'either' : 'both', // SKIP_WHEN=either: skip if favorites OR reposts reach the count
 };
 
 // ============ UTILITIES ============
@@ -647,6 +650,24 @@ function pruneFedTracks(state) {
   state.fed_tracks = Object.fromEntries(kept);
 }
 
+// ============ TRACK DETAILS PRE-CHECK ============
+// Tastemaker rewards only go to the first few fans of a track, so before touching a track we
+// read its current favorite/repost counts and leave it alone if it is already past that point.
+async function fetchTrackCounts(trackId) {
+  const data = await audiusGet(`/v1/tracks/${encodeURIComponent(trackId)}?app_name=tastemaker`, 'track details', CFG.callTimeoutMs);
+  const t = Array.isArray(data) ? data[0] : data;
+  if (!t || typeof t !== 'object') throw new Error('track details missing');
+  const favs = Number(t.favorite_count);
+  const reps = Number(t.repost_count);
+  if (!Number.isFinite(favs) || !Number.isFinite(reps)) throw new Error('track details have no favorite/repost counts');
+  return { favs, reps };
+}
+
+function isAlreadyPopular({ favs, reps }) {
+  const n = CFG.skipAtCount;
+  return CFG.skipWhen === 'either' ? (favs >= n || reps >= n) : (favs >= n && reps >= n);
+}
+
 async function interactTask(state, trackId, kind, acct) {
   const entry = state.fed_tracks[trackId];
   if (!entry) return { status: 'skip' };
@@ -809,11 +830,45 @@ async function doFeedInteract(sb, ctx, state, pool, primary) {
     return;
   }
 
-  const toProcess = isFirstRun ? newTracks : newTracks.slice(0, CFG.maxTracksPerRun);
-  log(`[*] Feed: ${tracks.length} tracks, ${newTracks.length} pending, processing ${toProcess.length} this run.`);
+  const limit = isFirstRun ? Infinity : CFG.maxTracksPerRun;
+  log(`[*] Feed: ${tracks.length} tracks, ${newTracks.length} pending, processing up to ${Number.isFinite(limit) ? limit : newTracks.length} this run.`);
 
-  for (const t of toProcess) {
+  let processed = 0;
+  for (const t of newTracks) {
     if (LOCK_LOST) break;
+    if (processed >= limit) break; // tracks skipped by the pre-check below do not use up the limit
+    const titlePart = t.title ? ` "${t.title.slice(0, 40)}"` : '';
+    const existing = state.fed_tracks[t.id];
+
+    // Pre-check, before the first interaction with a track. Once we have started on a track its
+    // counts include our own favorites/reposts, so tracks already in progress are not re-checked.
+    const started = existing && ((existing.favorited_by || []).length + (existing.reposted_by || []).length) > 0;
+    if (!started) {
+      let counts;
+      try {
+        counts = await fetchTrackCounts(t.id);
+      } catch (e) {
+        log(`[!] Track ${t.id}${titlePart} | could not read track details (${errMsg(e).slice(0, 60)}); not interacting now, will retry.`);
+        continue;
+      }
+      if (isAlreadyPopular(counts)) {
+        state.fed_tracks[t.id] = {
+          seen_at: new Date().toISOString(),
+          favorited_by: [],
+          reposted_by: [],
+          skipped: true,
+          skip_reason: 'already-popular',
+          favorite_count: counts.favs,
+          repost_count: counts.reps,
+        };
+        await saveState(sb, ctx, state);
+        log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | skipped (${CFG.skipWhen === 'either' ? 'either count' : 'both counts'} already >= ${CFG.skipAtCount}).`);
+        continue;
+      }
+      if (VERBOSE) log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | below ${CFG.skipAtCount}, interacting.`);
+    }
+
+    processed++;
     if (!state.fed_tracks[t.id]) {
       state.fed_tracks[t.id] = { seen_at: new Date().toISOString(), favorited_by: [], reposted_by: [] };
     }
@@ -831,7 +886,6 @@ async function doFeedInteract(sb, ctx, state, pool, primary) {
     if (!favResult.done) tags.push(`fav:${favResult.reason}`);
     if (!repResult.done) tags.push(`rep:${repResult.reason}`);
     const suffix = tags.length ? ` (${tags.join(', ')})` : '';
-    const titlePart = t.title ? ` "${t.title.slice(0, 40)}"` : '';
     log(`[*] Track ${t.id}${titlePart} | FAV ${entry.favorited_by.length}/${TARGET_INTERACTIONS} | REP ${entry.reposted_by.length}/${TARGET_INTERACTIONS}${suffix}`);
 
     if (CFG.actionDelayMs) await sleep(CFG.actionDelayMs);
@@ -968,4 +1022,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { runTastemaker, buildContext, CFG, TARGET_INTERACTIONS };
+module.exports = { runTastemaker, buildContext, CFG, TARGET_INTERACTIONS, fetchTrackCounts, isAlreadyPopular, doFeedInteract };

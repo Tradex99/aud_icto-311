@@ -18,6 +18,7 @@ const PROXY_URLS = [...new Set(
 )];
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
 
+<<<<<<< HEAD
 // --- Telegram Configuration ---
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '8560965744:AAFQA2ZQveGui9WMjVl3Krzx5o39ibFHuNs';
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '6807387667';
@@ -29,6 +30,8 @@ const SOLANA_RPC_URLS = (process.env.SOLANA_RPC_URLS || process.env.SOLANA_RPC_U
   .split(',').map(x => x.trim()).filter(Boolean);
 const PAYER_NOTIFY_THRESHOLD_SOL = Number(process.env.PAYER_NOTIFY_THRESHOLD_SOL || 0.069);
 
+=======
+>>>>>>> 88238ad (Add files via upload)
 // --- Intercept Fetch for Proxies ---
 {
   const realFetch = globalThis.fetch;
@@ -53,7 +56,12 @@ const PAYER_NOTIFY_THRESHOLD_SOL = Number(process.env.PAYER_NOTIFY_THRESHOLD_SOL
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
+<<<<<<< HEAD
 
+=======
+    
+    // Only proxy Audius API calls
+>>>>>>> 88238ad (Add files via upload)
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
 
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
@@ -133,11 +141,15 @@ process.on('uncaughtException', (err) => {
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DB_FILE = path.join(ROOT_DIR, 'db.txt');
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 88238ad (Add files via upload)
 const MAX_RETRIES = 5;
 const PENDING_MODE = process.argv.includes('--pending');
 const CLAIM_MODE = process.argv.includes('--claim');
 const DEBUG = process.argv.includes('--debug') || process.env.DEBUG === '1';
 const VERBOSE = process.argv.includes('--verbose') || process.env.VERBOSE === '1';
+<<<<<<< HEAD
 
 // --- Account filter (--address=, --email=, --user-id=, or positional) ---
 const KNOWN_FLAGS = new Set(['--pending', '--claim', '--debug', '--verbose']);
@@ -198,6 +210,18 @@ const AMOUNT_DECIMALS = 0;       // set to 8 if reward amounts come back in raw 
 const API_BASE = process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1';
 const BASE_DELAY_MS = 1000;      // backoff: 1s, 2s, 4s, 8s, 16s (+ jitter)
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+const ONLY_ADDRESS = (() => {
+  const m = process.argv.find(a => a.startsWith('--address='));
+  return m ? m.slice('--address='.length) : null;
+})();
+
+const PENDING_CONCURRENCY = Number(process.env.PENDING_CONCURRENCY || 5);
+const API_BASE = process.env.AUDIUS_API_BASE || 'https://api.audius.co/v1';
+const BASE_DELAY_MS = 1000;
+const PAGE_SIZE = Number(process.env.UNDISBURSED_PAGE_SIZE || 100);
+const MAX_PAGES = Number(process.env.UNDISBURSED_MAX_PAGES || 20);
+>>>>>>> 88238ad (Add files via upload)
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -210,6 +234,10 @@ const STATUS_NAMES = {
   409: 'conflict', 422: 'unprocessable', 429: 'rate limited',
 };
 
+<<<<<<< HEAD
+=======
+// Short, human-readable error: the HTTP status code and its name, never the API response body.
+>>>>>>> 88238ad (Add files via upload)
 function describeError(e) {
   const status = getStatus(e);
   if (status) return `HTTP ${status} ${STATUS_NAMES[status] || (status >= 500 ? 'server error' : status >= 400 ? 'client error' : 'unexpected status')}`;
@@ -238,9 +266,12 @@ async function withRetry(fn) {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 // --- Pending rewards (--pending) ---
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+>>>>>>> 88238ad (Add files via upload)
 const DAY_MS = 86400000;
 
 function toMs(v) {
@@ -252,6 +283,9 @@ function toMs(v) {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 88238ad (Add files via upload)
 function pickField(obj, ...names) {
   if (!obj || typeof obj !== 'object') return undefined;
   for (const name of names) {
@@ -260,6 +294,7 @@ function pickField(obj, ...names) {
   return undefined;
 }
 
+<<<<<<< HEAD
 // --- Telegram ---
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -491,6 +526,8 @@ function claimResponseValid(json, challengeId, specifier) {
   return { ok: false, reason: 'unrecognized response', error: JSON.stringify(json).slice(0, 200) };
 }
 
+=======
+>>>>>>> 88238ad (Add files via upload)
 const AMOUNT_DECIMALS = Number(process.env.AMOUNT_DECIMALS || 0);
 
 function amountOf(raw) {
@@ -500,9 +537,12 @@ function amountOf(raw) {
   return n / Math.pow(10, AMOUNT_DECIMALS);
 }
 
+<<<<<<< HEAD
 =======
 const amountOf = (raw) => { const n = Number(raw) / Math.pow(10, AMOUNT_DECIMALS); return Number.isFinite(n) ? n : 0; };
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+>>>>>>> 88238ad (Add files via upload)
 const plainAmount = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2));
 const fmtAmount = (n) => `${plainAmount(n)} $AUDIO`;
 
@@ -514,6 +554,9 @@ function fmtLeft(ms) {
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 88238ad (Add files via upload)
 async function fetchUndisbursedPage(appData, userId, offset, limit) {
   const qs = new URLSearchParams({
     limit: String(limit),
@@ -521,22 +564,29 @@ async function fetchUndisbursedPage(appData, userId, offset, limit) {
     api_key: appData.api_key,
     app_name: 'balance_checker',
   });
+<<<<<<< HEAD
 =======
 // Completed but unpaid rewards: "pending" while the cooldown (completed_at + cooldown_days) has not
 // passed, "ready to claim" afterwards (or when there is no cooldown).
 async function fetchUndisbursed(appData, userId) {
   const qs = new URLSearchParams({ limit: '100', api_key: appData.api_key, app_name: 'balance_checker' });
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+>>>>>>> 88238ad (Add files via upload)
   const headers = { Accept: 'application/json' };
   if (appData.bearer_token) headers.Authorization = `Bearer ${appData.bearer_token}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 20000);
   try {
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 88238ad (Add files via upload)
     const res = await fetch(`${API_BASE}/challenges/undisbursed/${userId}?${qs}`, {
       headers,
       signal: controller.signal,
     });
+<<<<<<< HEAD
     if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
     const json = await res.json();
     if (Array.isArray(json)) return json;
@@ -553,12 +603,27 @@ async function fetchUndisbursed(appData, userId) {
     const json = await res.json();
     return Array.isArray(json && json.data) ? json.data : [];
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+    if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+    const json = await res.json();
+    if (Array.isArray(json)) return json;
+    if (json && Array.isArray(json.data)) return json.data;
+    if (json && Array.isArray(json.challenges)) return json.challenges;
+    if (json && json.data && Array.isArray(json.data.challenges)) return json.data.challenges;
+    if (json && json.data && Array.isArray(json.data.items)) return json.data.items;
+    if (json && json.data && Array.isArray(json.data.results)) return json.data.results;
+    if (DEBUG) log(`  [debug] unrecognized response shape for user ${userId}: ${JSON.stringify(json).slice(0, 200)}`);
+    return [];
+>>>>>>> 88238ad (Add files via upload)
   } finally {
     clearTimeout(timer);
   }
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 88238ad (Add files via upload)
 async function fetchUndisbursed(appData, userId) {
   const all = [];
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -578,6 +643,7 @@ async function fetchUndisbursed(appData, userId) {
   return all;
 }
 
+<<<<<<< HEAD
 function classifyRewards(list, now) {
   const out = { ready: [], pending: [] };
   for (const r of list) {
@@ -599,22 +665,43 @@ function classifyRewards(list, now) {
       out.ready.push({ amount, raw: r });
     }
 =======
+=======
+>>>>>>> 88238ad (Add files via upload)
 function classifyRewards(list, now) {
   const out = { ready: [], pending: [] };
   for (const r of list) {
-    const amount = amountOf(r.amount);
-    const done = toMs(r.completed_at) ?? toMs(r.created_at);
-    const cooldown = Number(r.cooldown_days) || 0;
+    let amount = amountOf(pickField(r, 'amount', 'reward_amount', 'rewardAmount'));
+    const multiplier = Number(pickField(r, 'multiplier', 'reward_multiplier', 'payout_multiplier') || 1);
+    if (multiplier > 1) amount *= multiplier;
+    const total = pickField(r, 'total_amount', 'totalAmount');
+    if (total !== undefined) {
+      const t = amountOf(total);
+      if (t > 0) amount = t;
+    }
+    const done = toMs(pickField(r, 'completed_at', 'completedAt', 'completed_date'))
+      ?? toMs(pickField(r, 'created_at', 'createdAt', 'date_created'));
+    const cooldown = Number(pickField(r, 'cooldown_days', 'cooldownDays', 'cooldown')) || 0;
     const readyAt = done === null ? null : done + cooldown * DAY_MS;
+<<<<<<< HEAD
     if (readyAt !== null && readyAt > now) out.pending.push({ amount, left: readyAt - now });
     else out.ready.push({ amount });
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+    if (readyAt !== null && readyAt > now) {
+      out.pending.push({ amount, left: readyAt - now, raw: r });
+    } else {
+      out.ready.push({ amount, raw: r });
+    }
+>>>>>>> 88238ad (Add files via upload)
   }
   out.pending.sort((a, b) => a.left - b.left);
   return out;
 }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 88238ad (Add files via upload)
 async function claimReward(appData, userId, challengeId, specifier) {
   const body = { userId, challengeId, specifier };
 
@@ -640,22 +727,34 @@ async function claimReward(appData, userId, challengeId, specifier) {
     if (!res.ok) {
       const err = new Error(`HTTP ${res.status}`);
       err.status = res.status;
+<<<<<<< HEAD
       err.responseText = text;
       throw err;
     }
     return { json, text, status: res.status };
+=======
+      if (DEBUG) err.responseText = text.replace(/\s+/g, ' ').slice(0, 150);
+      throw err;
+    }
+    return json;
+>>>>>>> 88238ad (Add files via upload)
   } finally {
     clearTimeout(timer);
   }
 }
 
 async function claimAllReady(acc, readyList) {
+<<<<<<< HEAD
   const results = { claimed: 0, claimedAmount: 0, fatalFailed: 0, reasons: new Map(), solanaErrors: [] };
 
   const fail = (why) => {
     results.reasons.set(why, (results.reasons.get(why) || 0) + 1);
     results.fatalFailed++;
   };
+=======
+  const results = { claimed: 0, failed: 0, reasons: new Map() };
+  const fail = (why) => { results.failed++; results.reasons.set(why, (results.reasons.get(why) || 0) + 1); };
+>>>>>>> 88238ad (Add files via upload)
 
   for (const item of readyList) {
     const r = item.raw;
@@ -669,6 +768,7 @@ async function claimAllReady(acc, readyList) {
     }
 
     try {
+<<<<<<< HEAD
       const result = await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
       const json = result.json;
 
@@ -722,11 +822,22 @@ async function claimAllReady(acc, readyList) {
           results.solanaErrors.push({ address: acc.address, ...solInfo });
         }
       }
+=======
+      await withRetry(() => claimReward(acc.app_data, acc.user_id, challengeId, specifier));
+      results.claimed++;
+      if (VERBOSE) log(`  [claim] ${acc.address} ✓ ${challengeId} ${fmtAmount(item.amount)}`);
+    } catch (e) {
+      const why = describeError(e);
+      fail(why);
+      if (VERBOSE) log(`  [claim] ${acc.address} ✗ ${challengeId}: ${why}`);
+      if (DEBUG && e.responseText) log(`          response: ${e.responseText}`);
+>>>>>>> 88238ad (Add files via upload)
     }
   }
   return results;
 }
 
+<<<<<<< HEAD
 async function checkPending(accounts) {
   const now = Date.now();
   const filtered = applyFilter(accounts);
@@ -740,9 +851,22 @@ async function checkPending(accounts) {
   const queue = accounts.filter(a => a.user_id && a.app_data && a.app_data.api_key);
   const skipped = accounts.length - queue.length;
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+async function checkPending(accounts) {
+  const now = Date.now();
+  const filtered = ONLY_ADDRESS ? accounts.filter(a => a.address === ONLY_ADDRESS) : accounts;
+  const queue = filtered.filter(a => a.user_id && a.app_data && a.app_data.api_key);
+  const skipped = filtered.length - queue.length;
+>>>>>>> 88238ad (Add files via upload)
   const results = [];
   const reasons = new Map();
   let errors = 0;
+  let totalClaimed = 0;
+  let totalClaimFailed = 0;
+  const claimReasons = new Map();
+
+  if (ONLY_ADDRESS) log(`[*] Filtered to ${queue.length} account(s) matching --address=${ONLY_ADDRESS}.`);
+  if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
 
 <<<<<<< HEAD
   if (CLAIM_MODE) log(`[*] Claim mode active: will attempt to claim ready rewards.`);
@@ -772,6 +896,7 @@ async function checkPending(accounts) {
       try {
         const list = await withRetry(() => fetchUndisbursed(acc.app_data, acc.user_id));
 <<<<<<< HEAD
+<<<<<<< HEAD
         const classified = classifyRewards(list, now);
         const result = { address: acc.address, records: list, ...classified };
         results.push(result);
@@ -790,10 +915,23 @@ async function checkPending(accounts) {
         log(`[!] [${acc.address}] check failed: ${why}`);
 =======
         results.push({ address: acc.address, ...classifyRewards(list, now) });
+=======
+        const classified = classifyRewards(list, now);
+        const result = { address: acc.address, records: list, ...classified };
+
+        if (CLAIM_MODE && result.ready.length) {
+          const claim = await claimAllReady(acc, result.ready);
+          result.claim = claim;
+          totalClaimed += claim.claimed;
+          totalClaimFailed += claim.failed;
+          for (const [why, n] of claim.reasons) claimReasons.set(why, (claimReasons.get(why) || 0) + n);
+        }
+
+        results.push(result);
+>>>>>>> 88238ad (Add files via upload)
       } catch (e) {
         errors++;
-        const status = getStatus(e);
-        const why = status ? `HTTP ${status}` : String(e.message || e).slice(0, 40);
+        const why = describeError(e);
         reasons.set(why, (reasons.get(why) || 0) + 1);
 >>>>>>> d9e7a2c (Add files via upload)
       }
@@ -941,29 +1079,51 @@ async function checkPending(accounts) {
     (a.pending[0] ? a.pending[0].left : Infinity) - (b.pending[0] ? b.pending[0].left : Infinity));
 
   for (const x of withRewards) {
+    if (!x.ready.length && !(CLAIM_MODE && x.claim && x.claim.failed)) {
+      continue;
+    }
+
     const parts = [];
-    if (x.ready.length) parts.push(`ready to claim ${fmtAmount(sum(x.ready))}`);
-    if (x.pending.length === 1) parts.push(`pending ${fmtAmount(x.pending[0].amount)}, ${fmtLeft(x.pending[0].left)} left`);
-    else if (x.pending.length) parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
+    if (x.ready.length) {
+      parts.push(`ready to claim ${fmtAmount(sum(x.ready))} (${x.ready.length} reward${x.ready.length > 1 ? 's' : ''})`);
+    }
+    if (x.pending.length === 1) {
+      parts.push(`pending ${fmtAmount(x.pending[0].amount)}, ${fmtLeft(x.pending[0].left)} left`);
+    } else if (x.pending.length) {
+      parts.push(`pending ${fmtAmount(sum(x.pending))} (${x.pending.map(p => `${plainAmount(p.amount)} in ${fmtLeft(p.left)}`).join(', ')})`);
+    }
+    if (CLAIM_MODE && x.claim) {
+      const c = x.claim;
+      if (c.claimed) parts.push(`claimed ${c.claimed}`);
+      if (c.failed) parts.push(`${c.failed} failed (${[...c.reasons.keys()].join(', ')})`);
+    }
     log(`[${x.address}] ${parts.join(' | ')}`);
   }
 
   const allReady = results.flatMap(x => x.ready);
   const allPending = results.flatMap(x => x.pending);
   const summary = [
-    `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts`,
-    `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts`,
+    `ready to claim ${fmtAmount(sum(allReady))} in ${results.filter(x => x.ready.length).length} accounts (${allReady.length} rewards)`,
+    `pending ${fmtAmount(sum(allPending))} in ${results.filter(x => x.pending.length).length} accounts (${allPending.length} rewards)`,
   ];
   if (allPending.length) summary.push(`next unlock in ${fmtLeft(allPending.reduce((m, p) => Math.min(m, p.left), Infinity))}`);
   const none = results.length - withRewards.length;
   if (none) summary.push(`${none} with nothing to claim`);
   if (errors) summary.push(`${errors} errors (${[...reasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})`);
   if (skipped) summary.push(`${skipped} without credentials`);
+
+  if (CLAIM_MODE) {
+    summary.push(`claimed ${totalClaimed}, failed ${totalClaimFailed}${totalClaimFailed ? ` (${[...claimReasons.entries()].map(([k, n]) => `${k} x${n}`).join(', ')})` : ''}`);
+  }
+
   log(`[*] Pending rewards: ${summary.join(' | ')}.`);
 }
 
+<<<<<<< HEAD
 // --- Check Single Account ---
 >>>>>>> d9e7a2c (Add files via upload)
+=======
+>>>>>>> 88238ad (Add files via upload)
 async function checkAccount(supabase, account) {
   const address = account.address;
   const userId = account.user_id;
@@ -1115,6 +1275,7 @@ async function main() {
   }
 
 <<<<<<< HEAD
+<<<<<<< HEAD
   if (PENDING_MODE || CLAIM_MODE) {
     const modeLabel = CLAIM_MODE ? 'claim' : 'pending';
     log(`[*] Checking ${modeLabel} rewards for ${accounts.length} account(s) (page size ${PAGE_SIZE})...`);
@@ -1124,17 +1285,22 @@ async function main() {
 =======
   if (PENDING_MODE) {
     log(`[*] Checking pending rewards for ${accounts.length} accounts...`);
+=======
+  if (PENDING_MODE || CLAIM_MODE) {
+    const modeLabel = CLAIM_MODE ? 'claim' : 'pending';
+    log(`[*] Checking ${modeLabel} rewards for ${accounts.length} accounts (page size ${PAGE_SIZE})...`);
+>>>>>>> 88238ad (Add files via upload)
     await checkPending(accounts);
-    log(`[*] Pending reward check complete.`);
+    log(`[*] ${modeLabel.charAt(0).toUpperCase() + modeLabel.slice(1)} check complete.`);
     return;
   }
 
   log(`[*] Checking ${accounts.length} accounts one at a time...`);
-
   for (const acc of accounts) {
     await checkAccount(supabase, acc);
 >>>>>>> d9e7a2c (Add files via upload)
   }
+<<<<<<< HEAD
 
   const targets = applyFilter(accounts);
   if (FILTER && targets.length === 0) return;
@@ -1143,6 +1309,8 @@ async function main() {
   for (const acc of targets) {
     await checkAccount(supabase, acc);
   }
+=======
+>>>>>>> 88238ad (Add files via upload)
   log(`[*] Balance check complete.`);
 }
 
