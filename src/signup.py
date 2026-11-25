@@ -45,7 +45,7 @@ MAX_RUNS = 5
 #   True  -> LOG IN to the accounts below and finish their pending signup
 #   False -> normal signup flow (claim fresh accounts from the pool)
 # ---------------------------------------------------------------------------
-COMPLETE_INCOMPLETE_MODE = True
+COMPLETE_INCOMPLETE_MODE = False
 
 # Emails to process when COMPLETE_INCOMPLETE_MODE is True.
 # Leave empty ([]) to auto-discover every row with register='no'.
