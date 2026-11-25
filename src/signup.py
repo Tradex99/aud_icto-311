@@ -182,6 +182,20 @@ async def run_py(script: Path, *args: str) -> str:
     return stdout.decode()
 
 
+async def run_tempmail_inbox(address: str) -> str:
+    """
+    Fetch the inbox for <address> via `python3 tempmail.py inbox <address>`.
+    Mirrors login.py: does NOT raise on non-zero exit — returns whatever
+    stdout we got, so the OTP retry loop can just retry on empty output.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "python3", str(TEMPMAIL_SCRIPT), "inbox", address,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, _ = await proc.communicate()
+    return stdout.decode()
+
+
 def step_header(n: int, total: int, title: str) -> None:
     print(f"\n[{n}/{total}] {title}")
 
@@ -761,10 +775,21 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
 
         # Wait for either confirm-email or a redirect
         try:
-            await page.wait_for_url("**/signin/confirm-email**", timeout=45_000)
+            await page.wait_for_url(
+                "**/signin/confirm-email**",
+                wait_until="load", timeout=60_000,
+            )
             await page.wait_for_timeout(2000)
         except Exception:
             print(f"  [!] no confirm-email redirect (url: {page.url})")
+
+        # Some flows land on confirm-email a bit later even after the wait
+        # timed out — re-check once more.
+        if "confirm-email" not in page.url and "/signin" in page.url:
+            for _ in range(5):
+                await page.wait_for_timeout(1000)
+                if "confirm-email" in page.url:
+                    break
 
         if "confirm-email" in page.url:
             # ---- 3. OTP ----
@@ -780,8 +805,9 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
                         break
                     print(f"  attempt {attempt}/10: no OTP yet")
                 except Exception as e:
-                    print(f"  attempt {attempt}/10: {e}")
+                    print(f"  attempt {attempt}/10: tempmail inbox failed: {e}")
                 if attempt < 10:
+                    print("    -> waiting 5s for email to arrive...")
                     await page.wait_for_timeout(5000)
 
             if not otp:
