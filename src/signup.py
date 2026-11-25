@@ -26,6 +26,26 @@ TEMPMAIL_SCRIPT = SCRIPT_DIR / "tempmail.py"
 
 MAX_RUNS = 5
 
+# ---------------------------------------------------------------------------
+# Handle name source toggle
+#   True  -> use the CUSTOM_NAMES list below (ignores name.txt)
+#   False -> read random names from name.txt
+# ---------------------------------------------------------------------------
+USE_CUSTOM_NAMES = True
+
+CUSTOM_NAMES = [
+    "Luna Rose",
+    "Jayden Blake",
+    "Nova Skye",
+    "Zay Carter",
+    "Mila Storm",
+    "Kairo James",
+    "Ariana Lux",
+    "Dante King",
+    "Bella Moon",
+    "Ryder Cole",
+]
+
 API_PATTERN = re.compile(r"https?://api\.audius\.co/(?:v1/)?users/[^/]+/(?:coins|connected_wallets)")
 STEP_SETTLE_MS = 3_000
 PRE_FINAL_WAIT_MS = 20_000
@@ -105,8 +125,10 @@ def read_user_agent() -> str:
 
 
 def generate_handle() -> str:
+    if USE_CUSTOM_NAMES:
+        return random.choice(CUSTOM_NAMES)
     names = [n.strip() for n in NAME_FILE.read_text().splitlines() if n.strip()]
-    return f"{random.choice(names)}{random.randint(100, 999)}"
+    return random.choice(names)
 
 
 async def run_py(script: Path, *args: str) -> str:
@@ -455,7 +477,9 @@ async def main() -> None:
     failed = 0
     exhausted = False
 
+    src = "CUSTOM_NAMES list" if USE_CUSTOM_NAMES else "name.txt"
     print("[*] Audius signup")
+    print(f"[*] Handle source: {src}")
     for i in range(1, MAX_RUNS + 1):
         print(f"\n{'='*60}\n[*] Run {i}/{MAX_RUNS}\n{'='*60}")
         async with async_playwright() as pw:
