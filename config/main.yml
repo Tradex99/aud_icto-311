@@ -22,11 +22,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-<<<<<<< HEAD
-      # Node.js
-=======
-      # Node.js setup
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -37,42 +32,18 @@ jobs:
       - name: Install Node.js dependencies
         timeout-minutes: 10
         run: |
-<<<<<<< HEAD
-          npm install --no-save --prefer-online \
-            @audius/sdk@latest \
-            @supabase/supabase-js@latest
-
-=======
-          npm cache clean --force
-
           npm install --no-save --prefer-online \
             @audius/sdk@latest \
             @supabase/supabase-js@latest
 
       # Verify Node.js dependencies
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       - name: Verify Node.js dependencies
         run: |
           node --version
           npm --version
-<<<<<<< HEAD
           npm ls @audius/sdk @supabase/supabase-js
 
       # Python
-=======
-
-          npm ls @audius/sdk @supabase/supabase-js
-
-      # Check for unavailable Injective dependency
-      - name: Check Injective dependency
-        continue-on-error: true
-        run: |
-          npm ls @injectivelabs/utils || true
-
-          npm view @injectivelabs/utils versions --json
-
-      # Python setup
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -87,7 +58,6 @@ jobs:
           python -m pip install --disable-pip-version-check --upgrade pip
           python -m pip install --disable-pip-version-check -r requirements.txt
 
-<<<<<<< HEAD
           python --version
           python -m playwright --version
 
@@ -96,15 +66,10 @@ jobs:
         timeout-minutes: 12
         env:
           DEBIAN_FRONTEND: noninteractive
-=======
-      # Chromium + OS libraries
-      - name: Install Playwright Chromium (with OS deps)
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
         run: |
           echo "Installing Chromium OS dependencies..."
           date -u
 
-<<<<<<< HEAD
           timeout --signal=TERM --kill-after=30s 10m \
             python -m playwright install-deps chromium
 
@@ -128,68 +93,47 @@ jobs:
           echo "Chromium installation completed."
           date -u
 
-=======
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       # Xvfb
       - name: Install Xvfb
         timeout-minutes: 3
         run: |
           sudo apt-get install -y xvfb
 
-<<<<<<< HEAD
       # Audius automation
-=======
-      # Run login.py
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
-      - name: Run login.py under Xvfb
+      - name: Run bot under Xvfb
         timeout-minutes: 340
         env:
           PYTHONUNBUFFERED: "1"
           PYTHONIOENCODING: "utf-8"
         run: |
-<<<<<<< HEAD
           echo "Starting Audius monitor..."
           date -u
 
           timeout --signal=TERM --kill-after=60s 335m \
             xvfb-run -a \
             --server-args="-screen 0 1280x720x24" \
-            python3 -u src/login.py
+            python3 -u src/signup.py
 
           echo "Audius monitor finished."
           date -u
 
       # Next run
-=======
-          timeout 355m xvfb-run -a \
-            --server-args="-screen 0 1280x720x24" \
-            python3 -u src/login.py || true
-            
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
       - name: Trigger the next run
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPOSITORY: ${{ github.repository }}
         run: |
-<<<<<<< HEAD
           echo "Triggering next run..."
 
           curl --fail-with-body --silent --show-error \
             --retry 3 \
             --retry-delay 5 \
-=======
-          curl --fail-with-body --silent --show-error \
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6
             -X POST \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "https://api.github.com/repos/${GH_REPOSITORY}/dispatches" \
-<<<<<<< HEAD
             -d '{"event_type":"run-sporty"}'
 
           echo "Next run triggered."
-=======
-            -d '{"event_type":"run-sporty"}'
->>>>>>> ab4c62bbe941237b214f8ee1d8388eb23e6245c6

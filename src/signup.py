@@ -308,6 +308,28 @@ async def heartbeat_loop(supabase, address: str):
             pass
 
 
+def save_payload(supabase, email: str, payload: dict) -> None:
+    """
+    Update the DB row, gracefully dropping any columns that no longer exist
+    in the schema, so the rest of the data still gets saved.
+    """
+    while True:
+        try:
+            supabase.table("audius").update(payload).eq("address", email).execute()
+            return
+        except Exception as e:
+            # Supabase returns PGRST204 with a message like:
+            #   "Could not find the 'api_key' column of 'audius' in the schema cache"
+            m = re.search(r"Could not find the '([^']+)' column", str(e))
+            if not m:
+                raise
+            missing = m.group(1)
+            if missing not in payload:
+                raise
+            print(f"  [!] column '{missing}' does not exist in DB - dropping it and retrying")
+            payload.pop(missing)
+
+
 # --------------------------------------------------------------------------
 # Main worker
 # --------------------------------------------------------------------------
@@ -430,24 +452,26 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         await capture_wallet_apis(page, captured)
 
         # 3. Save credentials, handle, and user_id directly to the assigned row
+        #    NOTE: api_key column no longer exists in the DB schema, so we no
+        #    longer send it. save_payload() also strips any other missing
+        #    columns on the fly so the rest of the data still gets saved.
         payload = {
             "register": "yes",
-            "handle": handle
+            "handle": handle,
         }
-        
+
         if captured:
-            payload.update({
-                "api_key": captured["api_key"], 
-                "encoded_dm": captured["encoded_dm"], 
-                "encoded_ds": captured["encoded_ds"]
-            })
+            payload["encoded_dm"] = captured["encoded_dm"]
+            payload["encoded_ds"] = captured["encoded_ds"]
             if "user_id" in captured:
                 payload["user_id"] = captured["user_id"]
-            print(f"  saved credentials and handle to DB")
+
+        save_payload(supabase, email, payload)
+
+        if captured:
+            print(f"  saved wallet credentials + handle to DB")
         else:
             print(f"  saved handle to DB (no wallet credentials)")
-        
-        supabase.table("audius").update(payload).eq("address", email).execute()
         print(f"  marked {email} register='yes'")
         signup_done = True
 
