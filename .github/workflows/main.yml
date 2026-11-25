@@ -2,6 +2,8 @@
 name: audius
 
 on:
+  schedule:
+    - cron: '0 */10 * * *'
   repository_dispatch:
     types: [run-sporty]
   workflow_dispatch:
@@ -66,7 +68,7 @@ jobs:
           python --version
 
       # Run Audius automation
-      - name: Run login.py
+      - name: Run main.py
         timeout-minutes: 340
         env:
           PYTHONUNBUFFERED: "1"
@@ -76,7 +78,7 @@ jobs:
           date -u
 
           timeout --signal=TERM --kill-after=60s 335m \
-            python3 -u main.py follower.js handle=LunaRose,JaydenBlake,NovaSkye,ZayCarter,MilaStorm,KairoJames,ArianaLux,DanteKing,BellaMoon,RyderCole target=500
+            python3 main.py balance_checker.js --claim
 
           echo "Audius monitor finished."
           date -u
