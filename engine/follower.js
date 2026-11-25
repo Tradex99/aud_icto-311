@@ -118,6 +118,7 @@ const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
 // collide with scheduled daily runs (1..CFG.runsPerDay).
 const CUSTOM_RUN_START = 100;
 const CUSTOM_RUN_END = 200;
+const MAX_CUSTOM_HANDLES = 10;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -266,7 +267,8 @@ function latestHandles(upTracks) {
   return [...seen.values()];
 }
 
-// Parse a `follow=handle1,handle2,...` specification into published-shape entries.
+// Parse a `handle=h1,h2,...` (or legacy `follow=`) specification into published-shape entries.
+// Supports up to MAX_CUSTOM_HANDLES (10) unique handles; extras are ignored with a warning.
 function customHandles(spec, ctx) {
   const parsed = String(spec || '').split(',').map(s => s.trim().replace(/^@/, '')).filter(Boolean);
   if (!parsed.length) return [];
@@ -281,6 +283,11 @@ function customHandles(spec, ctx) {
     valid.push({ handle: h, address: null, date: ctx.today });
   }
   if (invalid.length) log(`[!] Ignoring invalid handle(s): ${invalid.join(', ')}`);
+  if (valid.length > MAX_CUSTOM_HANDLES) {
+    const extra = valid.slice(MAX_CUSTOM_HANDLES).map(v => v.handle);
+    log(`[!] Only ${MAX_CUSTOM_HANDLES} handles are supported; ignoring ${extra.length} extra: ${extra.join(', ')}`);
+    return valid.slice(0, MAX_CUSTOM_HANDLES);
+  }
   return valid;
 }
 
@@ -747,7 +754,7 @@ async function runFollower({ now = new Date(), follow = null, target = null } = 
   if (follow) {
     published = customHandles(follow, ctx);
     if (!published.length) {
-      log('[!] No valid handles provided for follow=. Exiting.');
+      log('[!] No valid handles provided for handle=. Exiting.');
       return { status: 'NO_TARGETS' };
     }
     log(`[*] Custom follow target(s): ${published.map(t => '@' + t.handle).join(', ')}`);
@@ -1036,19 +1043,21 @@ async function runList() {
 const MODE_ARG = process.argv.slice(2).find(a => /^id=/.test(a));
 
 if (require.main === module) {
-  const followArg = process.argv.slice(2).find(a => /^follow=/.test(a));
-  const targetArg = process.argv.slice(2).find(a => /^target=/.test(a));
-  const follow = followArg ? followArg.slice('follow='.length) : null;
+  const cliArgs = process.argv.slice(2);
+  // Accept handle=a,b,c (preferred) or follow=a,b,c (legacy). Repeated args are merged.
+  const handleArgs = cliArgs.filter(a => /^(handle|follow)=/.test(a));
+  const targetArg = cliArgs.find(a => /^target=/.test(a));
+  const follow = handleArgs.length ? handleArgs.map(a => a.slice(a.indexOf('=') + 1)).join(',') : null;
   const target = targetArg ? parseTarget(targetArg.slice('target='.length)) : null;
 
   let task;
   if (!MODE_ARG) {
     task = runFollower({ follow, target });
   } else if (MODE_ARG === 'id=2') {
-    if (follow || target) console.error('[!] follow= and target= are only supported in default mode (no id=). Ignoring for id=2.');
+    if (follow || target) console.error('[!] handle= and target= are only supported in default mode (no id=). Ignoring for id=2.');
     task = runBoost();
   } else if (MODE_ARG === 'id=3') {
-    if (follow || target) console.error('[!] follow= and target= are only supported in default mode (no id=). Ignoring for id=3.');
+    if (follow || target) console.error('[!] handle= and target= are only supported in default mode (no id=). Ignoring for id=3.');
     task = runList().then(() => process.exit(0));
   } else {
     console.error(`[!] Unknown mode "${MODE_ARG}". Use no argument, id=2 or id=3.`);
@@ -1059,9 +1068,3 @@ if (require.main === module) {
     process.exit(1);
   });
 }
-
-<<<<<<< HEAD
-module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, customHandles, parseTarget, CFG };
-=======
-module.exports = { runFollower, runBoost, runList, latestHandles, buildContext, customHandles, parseTarget, CFG };
->>>>>>> b84497c (Add files via upload)
