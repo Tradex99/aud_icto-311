@@ -19,16 +19,18 @@ jobs:
     timeout-minutes: 358
 
     steps:
+      # Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Node.js
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      # Install Audius and Supabase
+      # Install Node.js dependencies
       - name: Install Node.js dependencies
         timeout-minutes: 10
         run: |
@@ -56,51 +58,15 @@ jobs:
         timeout-minutes: 10
         run: |
           python -m pip install --disable-pip-version-check --upgrade pip
-          python -m pip install --disable-pip-version-check -r requirements.txt
+
+          python -m pip install \
+            --disable-pip-version-check \
+            -r requirements.txt
 
           python --version
-          python -m playwright --version
 
-      # Playwright OS dependencies
-      - name: Install Chromium OS dependencies
-        timeout-minutes: 12
-        env:
-          DEBIAN_FRONTEND: noninteractive
-        run: |
-          echo "Installing Chromium OS dependencies..."
-          date -u
-
-          timeout --signal=TERM --kill-after=30s 10m \
-            python -m playwright install-deps chromium
-
-          echo "OS dependencies installed."
-          date -u
-
-      # Playwright browser
-      - name: Install Playwright Chromium
-        timeout-minutes: 12
-        env:
-          PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT: "120000"
-        run: |
-          echo "Downloading Chromium..."
-          date -u
-
-          timeout --signal=TERM --kill-after=30s 10m \
-            python -m playwright install chromium
-
-          python -m playwright install --list
-
-          echo "Chromium installation completed."
-          date -u
-
-      # Xvfb
-      - name: Install Xvfb
-        timeout-minutes: 3
-        run: |
-          sudo apt-get install -y xvfb
-
-      # Audius automation
-      - name: Run login.py under Xvfb
+      # Run Audius automation
+      - name: Run login.py
         timeout-minutes: 340
         env:
           PYTHONUNBUFFERED: "1"
@@ -110,8 +76,6 @@ jobs:
           date -u
 
           timeout --signal=TERM --kill-after=60s 335m \
-            xvfb-run -a \
-            --server-args="-screen 0 1280x720x24" \
             python3 -u main.py follower.js handle=LunaRose,JaydenBlake,NovaSkye,ZayCarter,MilaStorm,KairoJames,ArianaLux,DanteKing,BellaMoon,RyderCole target=500
 
           echo "Audius monitor finished."
