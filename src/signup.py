@@ -15,6 +15,14 @@ Two modes (controlled by COMPLETE_INCOMPLETE_MODE below):
       whatever part of the signup wizard is still pending, capture user_id,
       and save {register, handle, user_id} to the DB. Handles are stored
       with spaces removed (e.g. "Luna Rose" -> "LunaRose").
+
+Handle uniqueness (both modes):
+  - Before picking a handle we query every non-null `handle` in the audius
+    table and skip any base name whose DB-normalized form is already taken.
+  - If every base name is used, we append random digits (100-999) like
+    login.py does, until we find an unused one.
+  - In the signup flow, if Audius rejects the pick, we try up to 3
+    different handles before giving up.
 """
 
 import asyncio
@@ -45,7 +53,7 @@ MAX_RUNS = 5
 #   True  -> LOG IN to the accounts below and finish their pending signup
 #   False -> normal signup flow (claim fresh accounts from the pool)
 # ---------------------------------------------------------------------------
-COMPLETE_INCOMPLETE_MODE = True
+COMPLETE_INCOMPLETE_MODE = False
 
 # Emails to process when COMPLETE_INCOMPLETE_MODE is True.
 # Leave empty ([]) to auto-discover every row with register='no'.
@@ -70,6 +78,8 @@ CUSTOM_NAMES = [
     "Bella Moon",
     "Ryder Cole",
 ]
+
+HANDLE_RETRY_ATTEMPTS = 3   # how many handles to try if Audius rejects one
 
 API_PATTERN = re.compile(
     r"https?://api\.audius\.co/(?:v1/)?users/[^/]+/(?:coins|connected_wallets)"
@@ -159,16 +169,78 @@ def read_user_agent() -> str:
     return random.choice(allowed)
 
 
-def generate_handle() -> str:
-    if USE_CUSTOM_NAMES:
-        return random.choice(CUSTOM_NAMES)
-    names = [n.strip() for n in NAME_FILE.read_text().splitlines() if n.strip()]
-    return random.choice(names)
-
-
 def handle_for_db(handle: str) -> str:
     """Strip spaces so 'Luna Rose' -> 'LunaRose' before saving to the DB."""
     return re.sub(r"\s+", "", handle)
+
+
+def _handle_key(handle: str) -> str:
+    """Normalized comparison key: spaces stripped, lowercased."""
+    return handle_for_db(handle).lower()
+
+
+def generate_handle(used_handles: set[str]) -> str:
+    """
+    Return a display handle whose DB-normalized form is NOT present in
+    `used_handles`.
+
+    Strategy:
+      1. Prefer a CUSTOM_NAMES / name.txt entry that isn't used.
+      2. If every base name is used, append random digits (100-999)
+         until an unused candidate is found.
+    """
+    if USE_CUSTOM_NAMES:
+        candidates = list(CUSTOM_NAMES)
+    else:
+        if not NAME_FILE.exists():
+            raise FileNotFoundError(f"name.txt not found at {NAME_FILE}")
+        candidates = [n.strip() for n in NAME_FILE.read_text().splitlines() if n.strip()]
+        if not candidates:
+            raise RuntimeError(f"No names found in {NAME_FILE}")
+
+    # --- Try base names first ---
+    available = [c for c in candidates if _handle_key(c) not in used_handles]
+    if available:
+        return random.choice(available)
+
+    # --- All base names used -> append digits ---
+    print(f"  [!] All {len(candidates)} base handle(s) already used in DB - appending digits")
+    for _ in range(200):
+        base = random.choice(candidates)
+        cand = f"{base}{random.randint(100, 999)}"
+        if _handle_key(cand) not in used_handles:
+            return cand
+
+    raise RuntimeError(
+        "Could not generate an unused handle after 200 attempts. "
+        "Add more names to CUSTOM_NAMES or name.txt."
+    )
+
+
+async def load_used_handles(supabase, exclude_email: str | None = None) -> set[str] | None:
+    """
+    Return every non-null handle in the audius table, normalized to the same
+    form generate_handle() uses for comparison. Rows belonging to `exclude_email`
+    are skipped so an account can keep its own handle across retries.
+
+    Returns:
+      - a set (possibly empty)  -> query succeeded
+      - None                    -> query failed; caller must abort, not guess
+    """
+    try:
+        res = await asyncio.to_thread(
+            lambda: supabase.table("audius").select("address, handle").execute()
+        )
+        used: set[str] = set()
+        for row in (res.data or []):
+            h = row.get("handle")
+            addr = row.get("address")
+            if h and addr != exclude_email:
+                used.add(_handle_key(str(h)))
+        return used
+    except Exception as e:
+        print(f"[!] Could not load used handles from DB: {e}")
+        return None
 
 
 async def run_py(script: Path, *args: str) -> str:
@@ -183,11 +255,7 @@ async def run_py(script: Path, *args: str) -> str:
 
 
 async def run_tempmail_inbox(address: str) -> str:
-    """
-    Fetch the inbox for <address> via `python3 tempmail.py inbox <address>`.
-    Mirrors login.py: does NOT raise on non-zero exit — returns whatever
-    stdout we got, so the OTP retry loop can just retry on empty output.
-    """
+    """Fetch inbox for <address> via `python3 tempmail.py inbox <address>`."""
     proc = await asyncio.create_subprocess_exec(
         "python3", str(TEMPMAIL_SCRIPT), "inbox", address,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
@@ -281,6 +349,27 @@ async def upload_profile_image(page, image_path: str) -> None:
         except Exception:
             continue
     raise RuntimeError("Could not upload profile image")
+
+
+async def detect_login_error(page) -> str | None:
+    """Best-effort read of any visible error message after a failed Log In."""
+    for sel in [
+        '[role="alert"]',
+        '[class*="error"]',
+        '[class*="Error"]',
+        '[class*="danger"]',
+        'p:has-text("Invalid")',
+        'p:has-text("incorrect")',
+        'div:has-text("Invalid")',
+        'div:has-text("Incorrect")',
+    ]:
+        try:
+            txt = await page.locator(sel).first.text_content(timeout=800)
+            if txt and txt.strip() and len(txt.strip()) < 200:
+                return txt.strip()
+        except Exception:
+            continue
+    return None
 
 
 def build_request_handler(captured: dict):
@@ -512,7 +601,7 @@ async def complete_wizard(page, handle_with_spaces: str, image_path: str) -> boo
 
 
 # --------------------------------------------------------------------------
-# Normal signup worker (original behavior, updated to strip spaces on save)
+# Normal signup worker (DB-aware handle selection + rejection retry)
 # --------------------------------------------------------------------------
 async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     TOTAL = 9
@@ -544,9 +633,23 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
     print(f"  email    : {email}")
     print(f"  password : {password}")
 
-    handle = generate_handle()
+    # ---- Load used handles from DB - abort if we can't verify uniqueness ----
+    used = await load_used_handles(supabase, exclude_email=email)
+    if used is None:
+        print("[!] Cannot verify handle uniqueness (DB query failed).")
+        print("[!] Aborting this run so we don't pick an already-claimed handle.")
+        rpc.release(email)
+        return False, email
+    print(f"  used handles in DB: {len(used)}")
+
+    try:
+        handle = generate_handle(used)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"[!] Handle generation failed: {e}")
+        rpc.release(email)
+        return False, email
     handle_db = handle_for_db(handle)
-    print(f"  handle   : {handle}  (DB will store: {handle_db})")
+    print(f"  handle   : {handle}  ->  DB will store: {handle_db}")
 
     try:
         img_out = (await run_py(IMG_SCRIPT)).strip()
@@ -610,12 +713,39 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
         if not await wait_for_redirect(page, url_before):
             return False, email
 
+        # ---- Handle step: retry up to HANDLE_RETRY_ATTEMPTS if rejected ----
         step_header(4, TOTAL, "Handle")
         await page.wait_for_load_state("domcontentloaded")
-        await fill_first_match(page, ['input[aria-label="Handle"]'], handle, "handle")
-        url_before = page.url
-        await click_first_match(page, CONTINUE_SELECTORS)
-        if not await wait_for_redirect(page, url_before):
+        handle_accepted = False
+        for attempt in range(1, HANDLE_RETRY_ATTEMPTS + 1):
+            print(f"  [handle attempt {attempt}/{HANDLE_RETRY_ATTEMPTS}] trying '{handle}'")
+            try:
+                await fill_first_match(page, ['input[aria-label="Handle"]'], handle, "handle")
+            except RuntimeError as e:
+                print(f"  [!] Handle input unavailable: {e}")
+                return False, email
+            url_before = page.url
+            try:
+                await click_first_match(page, CONTINUE_SELECTORS)
+            except RuntimeError as e:
+                print(f"  [!] Continue button missing: {e}")
+                return False, email
+            if await wait_for_redirect(page, url_before, max_seconds=15):
+                handle_accepted = True
+                break
+            # Audius rejected it — mark as used so we don't retry the same one
+            used.add(_handle_key(handle))
+            print(f"  [!] Handle '{handle}' rejected by Audius (still on {page.url})")
+            try:
+                handle = generate_handle(used)
+                handle_db = handle_for_db(handle)
+                print(f"  -> regenerated handle: {handle}  ->  DB: {handle_db}")
+            except (FileNotFoundError, RuntimeError) as e:
+                print(f"[!] Handle regeneration failed: {e}")
+                return False, email
+
+        if not handle_accepted:
+            print(f"[!] Audius rejected all {HANDLE_RETRY_ATTEMPTS} handle attempts.")
             return False, email
 
         step_header(5, TOTAL, "Profile")
@@ -644,7 +774,7 @@ async def run_signup(pw, supabase, tried: set[str]) -> tuple[bool, str | None]:
 
         payload = {
             "register": "yes",
-            "handle": handle_db,        # <-- stripped for DB
+            "handle": handle_db,
         }
         if captured:
             payload["encoded_dm"] = captured["encoded_dm"]
@@ -709,15 +839,33 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
         return False
 
     current_register = row.get("register")
+    existing_handle = row.get("handle")
     print(f"  register : {current_register}")
-    print(f"  handle   : {row.get('handle')}")
+    print(f"  handle   : {existing_handle}")
     print(f"  user_id  : {row.get('user_id')}")
     if current_register == "yes":
         print("  [!] register already 'yes' - will still try to refresh user_id/handle")
 
-    handle = generate_handle()
-    handle_db = handle_for_db(handle)
-    print(f"  generated handle: {handle}  ->  DB will store: {handle_db}")
+    # ---- Handle selection ----
+    if existing_handle:
+        handle_db = handle_for_db(str(existing_handle))
+        handle = str(existing_handle)
+        print(f"  reusing existing handle: {handle}  ->  DB: {handle_db}")
+        used = None  # not needed; we're not picking a new one
+    else:
+        used = await load_used_handles(supabase, exclude_email=email)
+        if used is None:
+            print("[!] Cannot verify handle uniqueness (DB query failed).")
+            print("[!] Aborting this run so we don't pick an already-claimed handle.")
+            return False
+        print(f"  used handles in DB: {len(used)}")
+        try:
+            handle = generate_handle(used)
+        except (FileNotFoundError, RuntimeError) as e:
+            print(f"[!] Handle generation failed: {e}")
+            return False
+        handle_db = handle_for_db(handle)
+        print(f"  generated handle: {handle}  ->  DB will store: {handle_db}")
 
     # ---- Generate profile image ----
     try:
@@ -773,23 +921,27 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
         await page.wait_for_timeout(1000)
         await click_first_match(page, LOGIN_BUTTON_SELECTORS)
 
-        # Wait for either confirm-email or a redirect
         try:
             await page.wait_for_url(
-                "**/signin/confirm-email**",
+                "https://audius.co/signin/confirm-email",
                 wait_until="load", timeout=60_000,
             )
             await page.wait_for_timeout(2000)
         except Exception:
             print(f"  [!] no confirm-email redirect (url: {page.url})")
 
-        # Some flows land on confirm-email a bit later even after the wait
-        # timed out — re-check once more.
-        if "confirm-email" not in page.url and "/signin" in page.url:
-            for _ in range(5):
-                await page.wait_for_timeout(1000)
-                if "confirm-email" in page.url:
-                    break
+        if "/signin" in page.url and "confirm-email" not in page.url:
+            err = await detect_login_error(page)
+            if err:
+                print(f"  [!] Signin error: {err}")
+            else:
+                print(f"  [!] Still on /signin - no visible error text")
+            try:
+                shot = SCRIPT_DIR / f"debug_login_{email.split('@')[0]}.png"
+                await page.screenshot(path=str(shot), full_page=True)
+                print(f"  [!] Screenshot saved: {shot}")
+            except Exception:
+                pass
 
         if "confirm-email" in page.url:
             # ---- 3. OTP ----
@@ -827,7 +979,6 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
         step_header(4, TOTAL, "Post-login state")
         print(f"  url      : {page.url}")
 
-        # Give the SPA a moment to settle and possibly bounce us to /signup/*
         for _ in range(30):
             if "/feed" in page.url or "/signup" in page.url:
                 break
@@ -845,7 +996,6 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
                 print(f"[!] Wizard did not complete (still at {page.url})")
                 return False
 
-            # Wait for /feed after wizard
             if "/feed" not in page.url:
                 if not await wait_for_leave_signup(page, REDIRECT_TIMEOUT_S):
                     print(f"[!] Still on signup: {page.url}")
@@ -853,12 +1003,7 @@ async def run_complete_incomplete(pw, supabase, email: str) -> bool:
             await page.wait_for_timeout(2000)
             print(f"  wizard done -> {page.url}")
         else:
-            # Account appears already complete - we'll try to grab an existing handle
             print("  account already complete (no wizard)")
-            existing_handle = row.get("handle")
-            if existing_handle:
-                handle_db = handle_for_db(existing_handle)
-                print(f"  reusing existing handle from DB: {handle_db}")
 
         # ---- 6. Capture user_id + save to DB ----
         step_header(6, TOTAL, "Capture user_id + save")
@@ -935,7 +1080,6 @@ async def run_signup_mode(supabase) -> None:
 
 
 async def run_complete_mode(supabase) -> None:
-    # Build target list
     targets = list(dict.fromkeys(COMPLETE_TARGETS))
     if not targets:
         print("[*] No explicit targets - querying rows with register='no' ...")
