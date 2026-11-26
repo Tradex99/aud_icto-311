@@ -168,6 +168,7 @@ const CFG = {
   skipWhen: /^either$/i.test(process.env.SKIP_WHEN || '') ? 'either' : 'both',
   commentsPerTrack: Number(process.env.COMMENTS_PER_TRACK || DEFAULT_COMMENTS_PER_TRACK),
   focusMaxTracks: Number(process.env.FOCUS_MAX_TRACKS || 0),
+  streamDurationMs: Number(process.env.STREAM_DURATION_SECONDS || 30) * 1000, // used only for the stream= hint
   _feedTarget: null,
 };
 
@@ -248,6 +249,10 @@ function parseCliFocus() {
     } else if (focus) {
       focus.streamTarget = n;
       log(`[*] Focus: stream target set to ${n} streams per track (via ./stream.js).`);
+      if (n >= 5000) {
+        const hours = Math.ceil((n * CFG.streamDurationMs) / 1000 / 10 / 3600);
+        log(`[!] Note: ${n} streams/track with ~${CFG.streamDurationMs / 1000}s/stream and 10 workers ≈ ${hours}h per track. Set MAX_RUN_MINUTES to cap.`);
+      }
     } else {
       log('[!] stream= is only supported with handle= (focus mode); ignoring.');
     }
@@ -424,6 +429,7 @@ function normalizeTmaker(raw, weekStart) {
     if (!isObj(h.followed)) h.followed = {};
     if (!isObj(h.fed_tracks)) h.fed_tracks = {};
     if (!isObj(h.cooldowns)) h.cooldowns = {};
+    if (!isObj(h.streams)) h.streams = {};        // owned by stream.js
     if (typeof h.first_run_done !== 'boolean') h.first_run_done = false;
     for (const e of Object.values(h.fed_tracks)) {
       if (!Array.isArray(e.favorited_by)) e.favorited_by = [];
@@ -436,12 +442,14 @@ function normalizeTmaker(raw, weekStart) {
     followed: {},
     fed_tracks: {},
     cooldowns: {},
+    streams: {},                                   // owned by stream.js
     first_run_done: false,
     last_trend_check: null,
     feed_fail_count: 0,
     feed_retry_at: null,
   };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
+  if (isObj(raw) && raw.stream_lock) h.stream_lock = raw.stream_lock;
   if (isObj(raw) && isObj(raw.cooldowns)) {
     const now = Date.now();
     for (const [addr, exp] of Object.entries(raw.cooldowns)) {
@@ -549,9 +557,26 @@ async function releaseLock(sb, ctx, lock) {
 
 async function saveState(sb, ctx, state) {
   await updateTmaker(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    // Preserve fields owned by other modules (stream.js) and our own lock.
     const lock = h.lock;
+    const streams = h.streams;
+    const streamLock = h.stream_lock;
+    const dbCooldowns = h.cooldowns || {};
+
     Object.assign(h, state);
+
+    if (streams !== undefined) h.streams = streams;
+    if (streamLock !== undefined) h.stream_lock = streamLock;
     if (lock) h.lock = lock;
+
+    // Merge cooldowns: later expiry wins, so we never overwrite a fresher
+    // cooldown that stream.js wrote with a stale value from our state copy.
+    const merged = { ...(state.cooldowns || {}) };
+    for (const [k, v] of Object.entries(dbCooldowns)) {
+      const existing = merged[k];
+      if (!existing || Date.parse(v) > Date.parse(existing)) merged[k] = v;
+    }
+    h.cooldowns = merged;
     return true;
   });
 }
@@ -776,7 +801,7 @@ function extractTracks(feedItems) {
   return out;
 }
 
-// ---- FIXED: keep focus entries across restarts (no 24h time-based pruning in focus mode) ----
+// ---- Focus mode: keep entries across restarts (no 24h time-based pruning) ----
 function pruneFedTracks(state, focus) {
   const entries = Object.entries(state.fed_tracks || {});
   let kept;
@@ -846,7 +871,7 @@ async function runBatch(tasks, concurrency) {
   }
 }
 
-// ---- FIXED: save per-batch so crashes lose ≤ concurrency interactions, not the whole phase ----
+// Save per-batch so crashes lose ≤ concurrency interactions, not the whole phase.
 async function interactTrackKind(state, trackId, kind, pool, targetCount, saveFn) {
   const entry = state.fed_tracks[trackId];
   if (!entry) return { done: false, reason: 'no-entry' };
@@ -1349,7 +1374,7 @@ async function runTastemaker({ now = new Date(), focus = null } = {}) {
     const availableNow = pool.filter(a => !isOnCooldown(state, a.address)).length;
     log(`[*] Pool: ${pool.length} accounts (${availableNow} available, ${pool.length - availableNow} cooling down).`);
 
-    // FIXED: pass focus so focus-mode entries aren't pruned by age.
+    // Focus mode: pass focus so focus-mode entries aren't pruned by age.
     pruneFedTracks(state, focus);
 
     if (focus) {
