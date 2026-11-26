@@ -1,30 +1,32 @@
 #!/usr/bin/env node
 'use strict';
 
-const STREAM_DURATION_MS = 60000;
+// ============ CONSTANTS ============
+const DEFAULT_TRENDING_HOURS = 5;
+const DEFAULT_HELPER_COUNT = 50;
+const DEFAULT_TRENDING_MIN = 1;
+const DEFAULT_TRENDING_MAX = 20;
+const DEFAULT_FEED_LIMIT = 30;
+const DEFAULT_MAX_TRACKS_PER_RUN = 5;
+const DEFAULT_FIRST_RUN_TRACKS = 10;
+const TARGET_INTERACTIONS = 20;
+const FOCUS_DEFAULT_TARGET = 200;
+const DEFAULT_COMMENTS_PER_TRACK = 50;
+const FEED_TRACK_MAX_AGE_MS = 24 * 3600 * 1000;
+const STATE_VERSION_MAX_TRACKS = 1000;
 
+// ============ IMPORTS ============
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const { AsyncLocalStorage } = require('node:async_hooks');
 const { createClient } = require('@supabase/supabase-js');
 
-const asyncLocalStorage = new AsyncLocalStorage();
-
-const DEFAULT_PROXIES = [
-  'https://audius-v2.qringgreen.workers.dev',
-  'https://audius-v2.qring99.workers.dev',
-  'https://audius.henrygreen311.workers.dev',
-  'https://audius-v2.henrygreen311.workers.dev',
-  'https://audius.qring99.workers.dev',
-  'https://audius.qringgreen.workers.dev',
-];
-const PROXY_URLS = [...new Set(
-  (process.env.AUDIUS_PROXY_URLS || DEFAULT_PROXIES.join(','))
-    .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean)
-)];
+const PROXY_URLS = (process.env.AUDIUS_PROXY_URLS ||
+  'https://audius-v2.qringgreen.workers.dev,https://audius-v2.qring99.workers.dev,https://audius.henrygreen311.workers.dev,https://audius-v2.henrygreen311.workers.dev,https://audius.qring99.workers.dev,https://audius.qringgreen.workers.dev')
+  .split(',').map(x => x.trim().replace(/\/+$/, '')).filter(Boolean);
 const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
+
 {
   const realFetch = globalThis.fetch;
   const CONNECT_ERRS = new Set(['ETIMEDOUT', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
@@ -47,25 +49,20 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
     console.log(`[*] Route: Cloudflare proxy (${PROXY_URLS.length})`);
     global.__AUDIUS_PROXY_LOGGED = true;
   }
+
   globalThis.fetch = async (input, init) => {
     const isReq = typeof input === 'object' && input !== null && 'url' in input;
     let url;
     try { url = new URL(isReq ? input.url : String(input)); } catch (_) { return realFetch(input, init); }
     if (url.hostname !== 'api.audius.co') return realFetch(input, init);
-
     const headers = new Headers((init && init.headers) || (isReq ? input.headers : undefined));
     if (PROXY_KEY) headers.set('x-proxy-key', PROXY_KEY);
     let lastErr;
     let lastProxy = null;
     let statusTries = 0;
-
     for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
-      const assigned = asyncLocalStorage.getStore()?.proxy;
-      const isAssignedHealthy = assigned && (downUntil.get(assigned) || 0) <= Date.now();
-
-      const proxy = (isAssignedHealthy && assigned !== lastProxy) ? assigned : pick(lastProxy);
+      const proxy = (lastProxy && PROXY_URLS.length > 1) ? pick(lastProxy) : pick();
       lastProxy = proxy;
-
       const target = proxy + url.pathname + url.search;
       let res;
       try {
@@ -92,23 +89,6 @@ const PROXY_KEY = process.env.AUDIUS_PROXY_KEY || '';
   };
 }
 
-const log = console.log.bind(console);
-let VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
-let lastBgLog = 0;
-process.on('unhandledRejection', e => {
-  if (Date.now() - lastBgLog < 30000) return;
-  lastBgLog = Date.now();
-  const c = e && e.cause && e.cause.code;
-  log(`[!] Background network error${c ? ` (${c})` : ''}; continuing.`);
-});
-for (const level of ['log', 'info', 'debug', 'warn']) {
-  const orig = console[level].bind(console);
-  console[level] = (...args) => {
-    if (typeof args[0] === 'string' && args[0].startsWith('[audius-sdk]')) return;
-    orig(...args);
-  };
-}
-
 let sdkPkg;
 try {
   sdkPkg = require('@audius/sdk');
@@ -127,48 +107,158 @@ if (!sdkFactory) {
   process.exit(1);
 }
 
+const log = console.log.bind(console);
+const VERBOSE = /^(1|true|yes)$/i.test(process.env.VERBOSE || '') || process.argv.includes('--verbose') || process.argv.includes('-v');
+const ONCE = process.argv.includes('--once');
+const FORCE_TRENDING = process.argv.includes('--force-trending');
+const FORCE_FEED = process.argv.includes('--force-feed');
+const FORCE_FIRST_RUN = process.argv.includes('--force-first-run');
+let lastBgLog = 0;
+process.on('unhandledRejection', e => {
+  if (Date.now() - lastBgLog < 30000) return;
+  lastBgLog = Date.now();
+  const c = e && e.cause && e.cause.code;
+  log(`[!] Background network error${c ? ` (${c})` : ''}; continuing.`);
+});
+for (const level of ['log', 'info', 'debug', 'warn']) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    if (typeof args[0] === 'string' && args[0].startsWith('[audius-sdk]')) return;
+    orig(...args);
+  };
+}
+
+// ============ PATHS ============
 const ROOT_DIR = path.resolve(__dirname, '..');
 const DB_FILE = path.join(ROOT_DIR, 'db.txt');
-const STATE_FILE = path.join(ROOT_DIR, '.audius_stream_state.json');
+const STATE_FILE = path.join(ROOT_DIR, '.audius_tastemaker_state.json');
 const TARGET_ADDRESS = 'qringgreen@gmail.com';
 
-// Custom runs (from tastemaker handle= + stream=) use run numbers 100..199 so they
-// never collide with scheduled daily runs 1..99.
-const CUSTOM_RUN_START = 100;
-const CUSTOM_RUN_END = 200;
-
+// ============ CONFIG ============
 const CFG = {
   timezone: process.env.RESET_TIMEZONE || 'America/Los_Angeles',
   resetHour: Number(process.env.RESET_HOUR ?? 12),
   dayTimezone: process.env.DAY_TIMEZONE || 'Africa/Lagos',
-  dailyPerTrack: Number(process.env.DAILY_STREAMS_PER_TRACK || 1000),
-  maxStreamsPerRun: Number(process.env.MAX_STREAMS_PER_RUN || process.env.MAX_STREAMS_PER_RUN_TODAY || 100),
-  streamDurationMs: Number(process.env.STREAM_DURATION_MS || STREAM_DURATION_MS),
-  streamDelayMs: Number(process.env.STREAM_DELAY_MS || 100),
+  trendingCheckMs: Number(process.env.TRENDING_CHECK_HOURS || DEFAULT_TRENDING_HOURS) * 3600000,
+  trendingMin: Number(process.env.TRENDING_MIN || DEFAULT_TRENDING_MIN),
+  trendingMax: Number(process.env.TRENDING_MAX || DEFAULT_TRENDING_MAX),
+  trendingTime: process.env.TRENDING_TIME || 'week',
+  helperCount: Number(process.env.HELPER_COUNT || DEFAULT_HELPER_COUNT),
+  feedLimit: Number(process.env.FEED_LIMIT || DEFAULT_FEED_LIMIT),
+  maxTracksPerRun: Number(process.env.MAX_TRACKS_PER_RUN || DEFAULT_MAX_TRACKS_PER_RUN),
+  firstRunTracks: Number(process.env.FIRST_RUN_TRACKS || DEFAULT_FIRST_RUN_TRACKS),
+  rateLimitCooldownMs: Number(process.env.RATE_LIMIT_COOLDOWN_MINUTES || 3) * 60000,
   lockTtlMs: Number(process.env.LOCK_TTL_MINUTES || 120) * 60000,
   lockStaleMs: Number(process.env.LOCK_STALE_SECONDS || 120) * 1000,
   retries: Number(process.env.RETRY_ATTEMPTS || 3),
   retryBaseMs: Number(process.env.RETRY_BASE_MS || 2000),
-  failStopAfter: Number(process.env.FAIL_STOP_AFTER || 30),
-  playRetries: Number(process.env.PLAY_RETRIES || 4),
-  stallMs: Number(process.env.STREAM_STALL_SECONDS || 15) * 1000,
-  bufferMs: Number(process.env.STREAM_BUFFER_SECONDS || 10) * 1000,
-  assumedKbps: Number(process.env.STREAM_ASSUMED_KBPS || 320),
-  callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 30) * 1000,
+  verifyDelayMs: Number(process.env.VERIFY_DELAY_MS || 300),
+  failStopAfter: Number(process.env.FAIL_STOP_AFTER || 15),
+  actionDelayMs: Number(process.env.ACTION_DELAY_MS || 50),
+  followDelayMs: Number(process.env.FOLLOW_DELAY_MS || 150),
+  concurrency: Number(process.env.CONCURRENCY || 12),
+  callTimeoutMs: Number(process.env.CALL_TIMEOUT_SECONDS || 20) * 1000,
+  feedTimeoutMs: Number(process.env.FEED_TIMEOUT_SECONDS || 15) * 1000,
   maxRunMs: Number(process.env.MAX_RUN_MINUTES || 0) * 60000,
-  workerCount: 10,
-  workerStaggerMs: Number(process.env.WORKER_STAGGER_MS || 5000),
-  workerJitterMs: Number(process.env.WORKER_JITTER_MS || 2000),
-  trendingLimit: Number(process.env.TRENDING_LIMIT || 100),
-  trendingTopMin: Number(process.env.TRENDING_TOP_MIN || 10),
-  trendingTopMax: Number(process.env.TRENDING_TOP_MAX || 20),
-  targetRangeMin: Number(process.env.TARGET_RANGE_MIN || 23),
-  targetRangeMax: Number(process.env.TARGET_RANGE_MAX || 27),
-  previousWeekPerRun: Number(process.env.PREVIOUS_WEEK_STREAMS_PER_RUN || 100),
+  rateWaitMs: Number(process.env.RATE_WAIT_MS || 3000),
+  loopIntervalMs: Number(process.env.LOOP_INTERVAL_SECONDS || 60) * 1000,
+  feedBackoffBaseMs: Number(process.env.FEED_BACKOFF_BASE_MS || 10000),
+  feedBackoffMaxMs: Number(process.env.FEED_BACKOFF_MAX_MS || 60000),
+  skipAtCount: Number(process.env.SKIP_AT_COUNT || 5),
+  skipWhen: /^either$/i.test(process.env.SKIP_WHEN || '') ? 'either' : 'both',
+  commentsPerTrack: Number(process.env.COMMENTS_PER_TRACK || DEFAULT_COMMENTS_PER_TRACK),
+  focusMaxTracks: Number(process.env.FOCUS_MAX_TRACKS || 0),
+  _feedTarget: null,
 };
 
-const TRACK_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+// ============ CLI ARGS ============
+const HANDLE_RE = /^[A-Za-z0-9_.]{1,30}$/;
 
+// parse "1000", "10k", "1m", "1.5k" etc.
+function parseCount(str) {
+  if (str === null || str === undefined) return null;
+  const s = String(str).trim().toLowerCase();
+  const m = s.match(/^(\d+(?:\.\d+)?)([kmb])?$/);
+  if (!m) return null;
+  const n = parseFloat(m[1]);
+  const mult = m[2] === 'k' ? 1000 : m[2] === 'm' ? 1000000 : m[2] === 'b' ? 1000000000 : 1;
+  const result = Math.floor(n * mult);
+  return Number.isInteger(result) && result > 0 ? result : null;
+}
+
+function parseCliFocus() {
+  const args = process.argv.slice(2);
+  const handleArg = args.find(a => /^handle=/i.test(a));
+  const targetArg = args.find(a => /^target=/i.test(a));
+  const streamArg = args.find(a => /^stream=/i.test(a));
+  const oldArg    = args.find(a => /^old=/i.test(a));
+
+  let focus = null;
+  if (handleArg) {
+    const raw = handleArg.slice(handleArg.indexOf('=') + 1).trim().replace(/^@/, '');
+    if (!HANDLE_RE.test(raw)) {
+      log(`[!] Ignoring invalid handle=${raw} (must match ${HANDLE_RE}).`);
+    } else {
+      focus = {
+        handle: raw,
+        target: FOCUS_DEFAULT_TARGET,
+        commentTarget: CFG.commentsPerTrack,
+        streamTarget: 0,
+        excludeUser: null,
+        oldCount: 0,
+      };
+      const cmt = focus.commentTarget > 0 ? ` + ${focus.commentTarget} comments/track` : '';
+      log(`[*] Focus mode: handle=@${raw} (target ${FOCUS_DEFAULT_TARGET} favs/reposts${cmt} per track).`);
+    }
+  }
+
+  // NEW: old=N — engage the N most recent NON-today tracks instead of today's uploads.
+  if (oldArg) {
+    const raw = oldArg.slice(oldArg.indexOf('=') + 1).trim();
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) {
+      log(`[!] Ignoring invalid old=${raw} (must be a positive integer).`);
+    } else if (focus) {
+      focus.oldCount = n;
+      log(`[*] Focus: will engage the ${n} most recent NON-today track(s) instead of today's uploads.`);
+    } else {
+      log('[!] old= is only supported with handle= (focus mode); ignoring.');
+    }
+  }
+
+  if (targetArg) {
+    const raw = targetArg.slice(targetArg.indexOf('=') + 1).trim();
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) {
+      log(`[!] Ignoring invalid target=${raw} (must be a non-negative integer).`);
+    } else if (focus) {
+      focus.target = n;
+      if (n === 0) log('[*] Focus: fav/repost disabled (target=0).');
+      else log(`[*] Focus target set to ${n} favs/reposts per track.`);
+    } else {
+      if (n === 0) log('[!] target=0 is only valid with handle= in focus mode; ignoring.');
+      else { CFG._feedTarget = n; log(`[*] Feed target set to ${n} favs/reposts per track.`); }
+    }
+  }
+
+  if (streamArg) {
+    const raw = streamArg.slice(streamArg.indexOf('=') + 1).trim();
+    const n = parseCount(raw);
+    if (n === null) {
+      log(`[!] Ignoring invalid stream=${raw} (must be positive, e.g. 1000, 10k, 1m).`);
+    } else if (focus) {
+      focus.streamTarget = n;
+      log(`[*] Focus: stream target set to ${n} streams per track (via ./stream.js).`);
+      if (n >= 5000) log(`[!] Note: ${n} streams/track with ~${CFG.streamDurationMs / 1000}s/stream and 10 workers ≈ ${Math.ceil((n * CFG.streamDurationMs) / 1000 / 10 / 3600)}h per track. Set MAX_RUN_MINUTES to cap.`);
+    } else {
+      log('[!] stream= is only supported with handle= (focus mode); ignoring.');
+    }
+  }
+
+  return focus;
+}
+
+// ============ UTILITIES ============
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const isObj = v => !!v && typeof v === 'object' && !Array.isArray(v);
 const statusOf = e => e && ((e.response && e.response.status) || e.status);
@@ -193,7 +283,7 @@ function isTransient(e) {
   const msg = String((e && e.message) || e).toLowerCase();
   const code = String((e && (e.code || (e.cause && e.cause.code))) || '').toUpperCase();
   return /ECONNRESET|ETIMEDOUT|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EPIPE|UND_ERR/.test(code) ||
-    /fetch failed|network|timeout|timed out|socket hang up|temporar|bad gateway|service unavailable|gateway/.test(msg);
+    /fetch failed|network|timeout|timed out|socket hang up|temporar|bad gateway|service unavailable|gateway|aborted/.test(msg);
 }
 
 function classify(e) {
@@ -213,16 +303,32 @@ async function withRetry(fn, retryIf = isTransient, tries = CFG.retries) {
   }
   throw lastErr;
 }
-
 function withTimeout(promise, ms = CFG.callTimeoutMs, what = 'request') {
   let t;
   const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`timeout: ${what} took longer than ${ms / 1000}s`)), ms); });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(t));
 }
+const readRetry = fn => withRetry(() => withTimeout(fn()), e => !isRateLimit(e) && isTransient(e));
 
 function addDays(ymd, n) {
   const [y, m, d] = ymd.split('-').map(Number);
   return new Date(Date.UTC(y, m - 1, d + n)).toISOString().slice(0, 10);
+}
+
+function ymdInTz(iso, tz) {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return null;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    }).formatToParts(d);
+    const p = {};
+    for (const x of parts) p[x.type] = x.value;
+    return `${p.year}-${p.month}-${p.day}`;
+  } catch (_) {
+    return null;
+  }
 }
 
 function buildContext(now) {
@@ -247,6 +353,7 @@ function buildContext(now) {
   return { today: `${d.year}-${d.month}-${d.day}`, dayName: d.weekday, dayIndex, weekStart: addDays(weekDay, -dayIndex), tz: CFG.timezone };
 }
 
+// ============ SUPABASE ============
 class LockLostError extends Error {}
 
 function connectSupabase() {
@@ -258,95 +365,117 @@ function connectSupabase() {
   return createClient(urlMatch[1], keyMatch[1]);
 }
 
-async function fetchRows(sb) {
+const hasCreds = r => !!(r && r.user_id && r.app_data && r.app_data.api_key && r.app_data.api_secret && r.app_data.bearer_token);
+
+function makeSdk(acct) {
+  return sdkFactory({
+    apiKey: acct.app_data.api_key,
+    apiSecret: acct.app_data.api_secret,
+    bearerToken: acct.app_data.bearer_token,
+  });
+}
+
+async function fetchPrimary(sb) {
+  const { data, error } = await withRetry(async () => {
+    const { data, error } = await sb.from('audius')
+      .select('address, handle, user_id, app_data, t_maker')
+      .eq('address', TARGET_ADDRESS).limit(1);
+    if (error) {
+      const e = new Error(/t_maker/i.test(error.message) && /column|exist|schema/i.test(error.message)
+        ? 'audius.t_maker column is missing - run: ALTER TABLE audius ADD COLUMN t_maker jsonb;' : error.message);
+      e.fatal = true;
+      throw e;
+    }
+    return { data, error };
+  }, e => !e.fatal);
+  if (!data || !data[0]) throw new Error(`row not found in audius table: ${TARGET_ADDRESS}`);
+  return data[0];
+}
+
+async function fetchHelperPool(sb, primaryAddress) {
   const out = [];
-  const page = 1000;
-  for (let from = 0; ; from += page) {
+  const page = 200;
+  for (let from = 0; from < 10 * page; from += page) {
     const data = await withRetry(async () => {
-      const { data, error } = await sb.from('audius').select('address, handle, user_id, app_data, stream')
-        .order('address', { ascending: true }).range(from, from + page - 1);
-      if (error) {
-        const e = new Error(/stream/i.test(error.message) && /column|exist|schema/i.test(error.message)
-          ? 'audius.stream column is missing - run the SQL migration first.' : error.message);
-        e.fatal = true;
-        throw e;
-      }
+      const { data, error } = await sb.from('audius')
+        .select('address, handle, user_id, app_data')
+        .neq('address', primaryAddress)
+        .not('user_id', 'is', null)
+        .not('app_data', 'is', null)
+        .order('address', { ascending: true })
+        .range(from, from + page - 1);
+      if (error) { const e = new Error(error.message); e.fatal = true; throw e; }
       return data || [];
     }, e => !e.fatal);
     out.push(...data);
     if (data.length < page) break;
   }
-  if (!out.some(r => r.address === TARGET_ADDRESS)) throw new Error(`row not found in audius table: ${TARGET_ADDRESS}`);
-  return out;
+  return out.filter(hasCreds);
 }
 
-async function readUpTracks(sb) {
-  const { data, error } = await sb.from('audius').select('up_tracks').eq('address', TARGET_ADDRESS).limit(1);
-  if (error) throw new Error(`could not read up_tracks: ${error.message}`);
-  return data && data[0] ? data[0].up_tracks : null;
-}
-
-function collectTracks(upTracks) {
-  const days = isObj(upTracks) && Array.isArray(upTracks.days) ? upTracks.days : [];
-  const ok = days.filter(d => d && d.status === 'success' && d.track_id != null && typeof d.date === 'string' &&
-    TRACK_ID_RE.test(String(d.track_id).trim()));
-  if (!ok.length) return [];
-  const latest = ok.reduce((m, d) => (d.date > m ? d.date : m), ok[0].date);
-  const seen = new Map();
-  for (const d of ok) {
-    if (d.date !== latest) continue;
-    const id = String(d.track_id).trim();
-    if (seen.has(id)) continue;
-    seen.set(id, {
-      id, key: id, address: d.address || null, handle: typeof d.handle === 'string' ? d.handle : null,
-      date: latest, cap: CFG.dailyPerTrack,
-      maxPerRun: CFG.maxStreamsPerRun || CFG.dailyPerTrack,
-    });
-  }
-  return [...seen.values()];
-}
-
+// ============ STATE ============
 function sameWeek(raw, weekStart) {
   if (!isObj(raw)) return false;
-  if (raw.week_start === weekStart) return true;
-  if (!Array.isArray(raw.runs) || !raw.runs.length) return false;
-  const end = addDays(weekStart, 8);
-  return raw.runs.every(r => r.date >= weekStart && r.date < end);
+  return raw.week_start === weekStart;
 }
 
-function normalizeStream(raw, weekStart) {
-  if (sameWeek(raw, weekStart) && Array.isArray(raw.runs)) {
+function normalizeTmaker(raw, weekStart) {
+  if (sameWeek(raw, weekStart) && isObj(raw)) {
     const h = JSON.parse(JSON.stringify(raw));
     h.week_start = weekStart;
+    if (!isObj(h.followed)) h.followed = {};
+    if (!isObj(h.fed_tracks)) h.fed_tracks = {};
+    if (!isObj(h.cooldowns)) h.cooldowns = {};
+    if (typeof h.first_run_done !== 'boolean') h.first_run_done = false;
+    for (const e of Object.values(h.fed_tracks)) {
+      if (!Array.isArray(e.favorited_by)) e.favorited_by = [];
+      if (!Array.isArray(e.reposted_by)) e.reposted_by = [];
+    }
     return h;
   }
-  const h = { week_start: weekStart, runs: [] };
+  const h = {
+    week_start: weekStart,
+    followed: {},
+    fed_tracks: {},
+    cooldowns: {},
+    first_run_done: false,
+    last_trend_check: null,
+    feed_fail_count: 0,
+    feed_retry_at: null,
+  };
   if (isObj(raw) && raw.lock) h.lock = raw.lock;
+  if (isObj(raw) && isObj(raw.cooldowns)) {
+    const now = Date.now();
+    for (const [addr, exp] of Object.entries(raw.cooldowns)) {
+      const t = Date.parse(exp);
+      if (Number.isFinite(t) && t > now) h.cooldowns[addr] = exp;
+    }
+  }
   return h;
 }
 
 let HELD_LOCK = null;
 
-async function updateStream(sb, address, weekStart, mutate) {
+async function updateTmaker(sb, address, weekStart, mutate) {
   let lastErr;
   for (let attempt = 1; attempt <= 8; attempt++) {
     try {
-      const { data, error } = await sb.from('audius').select('address, stream').eq('address', address).limit(1);
+      const { data, error } = await sb.from('audius').select('address, t_maker').eq('address', address).limit(1);
       if (error) throw new Error(error.message);
       if (!data || !data[0]) throw Object.assign(new Error(`account row not found: ${address}`), { fatal: true });
-      const raw = data[0].stream;
-      const hist = normalizeStream(raw, weekStart);
+      const raw = data[0].t_maker;
+      const hist = normalizeTmaker(raw, weekStart);
       if (address === TARGET_ADDRESS && HELD_LOCK && !(hist.lock && hist.lock.token === HELD_LOCK.token)) {
-        throw new LockLostError('batch lock was taken over by another run');
+        throw new LockLostError('tastemaker lock was taken over by another run');
       }
       if (mutate(hist) === false) return hist;
       const prevV = isObj(raw) && Number.isInteger(raw.v) ? raw.v : null;
       hist.v = (prevV || 0) + 1;
-      let q = sb.from('audius').update({ stream: hist }).eq('address', address);
-      q = prevV === null ? q.is('stream->>v', null) : q.eq('stream->>v', String(prevV));
-      const res = await q.select('address, stream');
+      let q = sb.from('audius').update({ t_maker: hist }).eq('address', address);
+      q = prevV === null ? q.is('t_maker->>v', null) : q.eq('t_maker->>v', String(prevV));
+      const res = await q.select('address, t_maker');
       if (res.error) throw new Error(res.error.message);
-      if (res.data && res.data.length === 1) return normalizeStream(res.data[0].stream, weekStart);
+      if (res.data && res.data.length === 1) return normalizeTmaker(res.data[0].t_maker, weekStart);
       lastErr = new Error(`update conflict for ${address}`);
       await sleep(100 + Math.random() * 300);
     } catch (e) {
@@ -358,47 +487,10 @@ async function updateStream(sb, address, weekStart, mutate) {
   throw lastErr;
 }
 
-async function recordStream(sb, weekStart, address, f) {
-  const key = String(f.track_id);
-  await updateStream(sb, address, weekStart, h => {
-    let run = h.runs.find(r => r.date === f.date && r.run_number === f.run_number);
-    if (!run) { run = { date: f.date, day: f.day, run_number: f.run_number, tracks: [] }; h.runs.push(run); }
-    const entry = run.tracks.find(t => String(t.track_id) === key && t.status === 'success');
-    if (entry) {
-      entry.count = (entry.count || 1) + 1;
-      entry.streamed_at = f.at;
-    } else {
-      run.tracks.push({ track_id: key, status: 'success', count: 1, streamed_at: f.at });
-    }
-    return true;
-  });
-}
-
-let PENDING = [];
-function loadPending() {
-  try { const j = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); return Array.isArray(j.pending) ? j.pending : []; } catch (_) { return []; }
-}
-function savePending() {
-  const tmp = `${STATE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ pending: PENDING }));
-  fs.renameSync(tmp, STATE_FILE);
-}
-async function flushPending(sb, ctx) {
-  if (!PENDING.length) return;
-  const keep = [];
-  for (const p of PENDING) {
-    if (!(p.date >= ctx.weekStart && p.date < addDays(ctx.weekStart, 8))) continue;
-    try { await recordStream(sb, ctx.weekStart, p.address, p); } catch (_) { keep.push(p); }
-  }
-  log(`[*] Recovered ${PENDING.length - keep.length}/${PENDING.length} unsaved streams.`);
-  PENDING = keep;
-  savePending();
-}
-
 function lockStaleReason(lock) {
   if (!(Date.parse(lock.expires_at) > Date.now())) return 'it expired';
   const beat = Date.parse(lock.beat || lock.acquired_at);
-  if (!Number.isFinite(beat) || Date.now() - beat > CFG.lockStaleMs) return 'its owner stopped responding (cancelled run)';
+  if (!Number.isFinite(beat) || Date.now() - beat > CFG.lockStaleMs) return 'its owner stopped responding';
   if (lock.pid && lock.host === os.hostname()) {
     try { process.kill(lock.pid, 0); } catch (e) { if (e.code !== 'EPERM') return 'its owner process is no longer running'; }
   }
@@ -408,7 +500,7 @@ function lockStaleReason(lock) {
 async function acquireLock(sb, ctx) {
   const token = crypto.randomUUID();
   let blocked = null;
-  await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+  await updateTmaker(sb, TARGET_ADDRESS, ctx.weekStart, h => {
     blocked = null;
     if (h.lock && h.lock.token) {
       const why = lockStaleReason(h.lock);
@@ -421,7 +513,7 @@ async function acquireLock(sb, ctx) {
     };
     return true;
   });
-  if (blocked) { log('[!] Another run is active. Exiting.'); return null; }
+  if (blocked) { log('[!] Another tastemaker run is active. Exiting.'); return null; }
   return { token };
 }
 
@@ -433,7 +525,7 @@ function startHeartbeat(sb, ctx) {
     if (busy || LOCK_LOST) return;
     busy = true;
     try {
-      await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+      await updateTmaker(sb, TARGET_ADDRESS, ctx.weekStart, h => {
         h.lock.beat = new Date().toISOString();
         h.lock.expires_at = new Date(Date.now() + CFG.lockTtlMs).toISOString();
         return true;
@@ -447,671 +539,866 @@ function startHeartbeat(sb, ctx) {
 async function releaseLock(sb, ctx, lock) {
   if (!lock) return;
   try {
-    await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    await updateTmaker(sb, TARGET_ADDRESS, ctx.weekStart, h => {
       if (!h.lock || h.lock.token !== lock.token) return false;
       delete h.lock;
       return true;
     });
   } catch (e) {
-    console.error(`[!] Could not release lock (it expires on its own): ${e.message}`);
+    console.error(`[!] Could not release lock (expires on its own): ${e.message}`);
   }
 }
 
-const hasCreds = r => !!(r.user_id && r.app_data && r.app_data.api_key && r.app_data.bearer_token);
-
-function makeSdk(acct) {
-  return sdkFactory({
-    apiKey: acct.app_data.api_key,
-    apiSecret: acct.app_data.api_secret,
-    bearerToken: acct.app_data.bearer_token,
+async function saveState(sb, ctx, state) {
+  await updateTmaker(sb, TARGET_ADDRESS, ctx.weekStart, h => {
+    const lock = h.lock;
+    Object.assign(h, state);
+    if (lock) h.lock = lock;
+    return true;
   });
 }
 
-async function getTrackMeta(run, target, sdk) {
-  if (!run.meta.has(target.key)) {
-    const p = (async () => {
-      const res = await withTimeout(
-        sdk.tracks.getTrack({ trackId: target.id }),
-        CFG.callTimeoutMs,
-        'getTrack'
-      );
-      const d = res && res.data;
-      if (!d) throw new Error('track info missing');
-
-      const duration = Number(d.duration);
-      const streamUrl = d.stream && d.stream.url;
-      if (!streamUrl) throw new Error('track has no stream URL (may be gated)');
-
-      return {
-        streamUrl,
-        duration: Number.isFinite(duration) && duration > 0 ? duration : 180,
-      };
-    })();
-    run.meta.set(target.key, p);
-    p.catch(() => run.meta.delete(target.key));
-  }
-  return run.meta.get(target.key);
-}
-
-function tracksBelowCap(rows, published, ctx) {
-  const today = countTracks(rows, ctx);
-  return published.filter(p => (today.get(p.key) || 0) < p.cap);
-}
-
-function allDoneMsg(n) {
-  return `[*] All ${n} tracks reached their daily stream limit. Exiting.`;
-}
-
-// Scheduled runs use 1..99. Custom runs (from tastemaker) use 100..199.
-function dayState(coord, today) {
-  const todays = (coord.batches || []).filter(x => x.date === today && x.run_number < CUSTOM_RUN_START);
-  const open = todays.find(x => !x.done);
-  if (open) return { runNumber: open.run_number, batch: open };
-  return { runNumber: todays.reduce((m, x) => Math.max(m, x.run_number), 0) + 1, batch: null };
-}
-
-// First free custom slot for today.
-function nextCustomRunNumber(coord, today) {
-  for (let n = CUSTOM_RUN_START; n < CUSTOM_RUN_END; n++) {
-    const b = (coord.batches || []).find(x => x.date === today && x.run_number === n);
-    if (!b || !b.done) return { runNumber: n, batch: b || null };
-  }
-  return null;
-}
-
-function reason(e) {
-  if (isRateLimit(e)) return '429';
-  const code = statusOf(e);
-  if (code) return `HTTP ${code}${e.detail ? ` ${e.detail}` : ''}`;
-  const m = String((e && e.message) || e);
-  if (/timeout|timed out/i.test(m)) return 'timeout';
-  return m.slice(0, 50);
-}
-
-async function readChunk(reader, ms) {
-  let timer;
-  const stall = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`stalled for ${ms / 1000}s`)), ms); });
-  try {
-    return await Promise.race([reader.read(), stall]);
-  } finally {
-    clearTimeout(timer);
+// ============ COOLDOWNS ============
+function pruneCooldowns(state) {
+  const now = Date.now();
+  for (const [addr, exp] of Object.entries(state.cooldowns)) {
+    if (Date.parse(exp) <= now) delete state.cooldowns[addr];
   }
 }
 
-async function playStream(streamUrl, playMs, durationSec) {
-  const controller = new AbortController();
-  const connectTimer = setTimeout(() => controller.abort(), CFG.callTimeoutMs);
-  const overallTimer = setTimeout(() => controller.abort(), playMs + CFG.callTimeoutMs * 2);
-  let reader = null;
-  let bytes = 0;
-  const interrupted = (msg, extra) => Object.assign(new Error(`interrupted: ${msg} after ${Math.round(bytes / 1024)} KB`), { interrupted: true, bytes, ...extra });
-  try {
-    let res;
-    try {
-      res = await fetch(streamUrl, {
-        headers: { Accept: '*/*' },
-        redirect: 'follow',
-        signal: controller.signal,
-      });
-    } catch (e) {
-      if (controller.signal.aborted) throw new Error(`timeout: stream request took longer than ${CFG.callTimeoutMs / 1000}s`);
-      throw e;
-    } finally {
-      clearTimeout(connectTimer);
-    }
-
-    if (!res.ok) {
-      let detail = '';
-      try { detail = (await res.text()).replace(/\s+/g, ' ').trim().slice(0, 80); } catch (_) {}
-      throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status, detail });
-    }
-    if (!res.body) throw new Error('empty stream response');
-
-    const length = Number(res.headers.get('content-length')) || 0;
-    const rate = length > 0 && durationSec > 0 ? length / durationSec : CFG.assumedKbps * 125;
-    const expectedBytes = length || rate * durationSec;
-    reader = res.body.getReader();
-
-    let firstAt = 0;
-    let ended = false;
-    for (;;) {
-      const wall = firstAt ? Date.now() - firstAt : 0;
-      if (firstAt && wall >= playMs) break;
-      let chunk;
-      try {
-        chunk = await readChunk(reader, firstAt ? CFG.stallMs : CFG.callTimeoutMs);
-      } catch (e) {
-        const msg = controller.signal.aborted ? `timeout after ${Math.round(playMs / 1000)}s limit` : e.message;
-        if (!bytes) throw new Error(`no audio received (${msg})`);
-        throw interrupted(msg);
-      }
-      if (chunk.done) { ended = true; break; }
-      if (!chunk.value || !chunk.value.length) continue;
-      if (!firstAt) firstAt = Date.now();
-      bytes += chunk.value.length;
-      const mediaMs = (bytes / rate) * 1000;
-      const now = Date.now() - firstAt;
-      const ahead = mediaMs - now - CFG.bufferMs;
-      if (ahead > 0) await sleep(Math.min(ahead, Math.max(0, playMs - now)));
-    }
-
-    if (!bytes) throw new Error('empty stream response');
-    const wallMs = Date.now() - firstAt;
-    const mediaMs = (bytes / rate) * 1000;
-    if (ended) {
-      if (bytes < expectedBytes * 0.9) throw interrupted(`stream ended early (${Math.round(bytes / 1024)} of ${Math.round(expectedBytes / 1024)} KB)`, { ended: true });
-    } else if (bytes < rate * (playMs / 1000) * 0.9) {
-      throw interrupted(`only ${Math.round(bytes / 1024)} of ${Math.round((rate * playMs) / 1000 / 1024)} KB delivered in ${Math.round(wallMs / 1000)}s`);
-    }
-    return { bytes, wallMs, playbackMs: Math.min(mediaMs, wallMs), ended, status: res.status, contentType: res.headers.get('content-type') || 'unknown' };
-  } finally {
-    clearTimeout(connectTimer);
-    clearTimeout(overallTimer);
-    if (reader) await reader.cancel().catch(() => {});
-    controller.abort();
-  }
+function isOnCooldown(state, address) {
+  const exp = state.cooldowns[address];
+  if (!exp) return false;
+  return Date.parse(exp) > Date.now();
 }
 
-async function streamJob(sb, ctx, run, acct, target, workerId) {
-  const st = run.stats;
-  const who = acct.handle ? `@${acct.handle}` : acct.address;
-  const say = text => { if (VERBOSE) log(`[${workerId}] ${who} -> track ${target.id} | ${text}`); };
-  let result = null;
-  let outcome;
-  let stage = 'trackInfo';
-
-  try {
-    let sdk = run.sdks.get(acct.address);
-    if (!sdk) { sdk = makeSdk(acct); run.sdks.set(acct.address, sdk); }
-
-    result = await withRetry(async () => {
-      stage = 'trackInfo';
-      const meta = await getTrackMeta(run, target, sdk);
-      let playMs = CFG.streamDurationMs;
-      stage = 'play';
-      return playStream(meta.streamUrl, playMs, meta.duration);
-    }, e => {
-      if (e && e.interrupted) return false;
-      const code = statusOf(e);
-      if (code >= 500 || code === 408) { run.meta.delete(target.key); say(`${stage}: ${reason(e)}; retrying`); return true; }
-      return false;
-    }, CFG.playRetries);
-    run.consecFail = 0;
-    outcome = 'ok';
-    st.ok++;
-  } catch (e) {
-    const kind = classify(e);
-    const why = `${stage}: ${reason(e)}`;
-    run.reasons.set(why, (run.reasons.get(why) || 0) + 1);
-    if (e && e.interrupted) { outcome = 'interrupted'; st.interrupted++; say(why); }
-    else if (kind === 'rate') { outcome = 'rate'; st.rate++; say(why); }
-    else if (kind === 'permanent') { outcome = 'perm'; st.perm++; run.cool.add(acct.address); say(why); }
-    else { outcome = 'retry'; st.retry++; say(why); }
-    if (++run.consecFail >= CFG.failStopAfter && !run.stop) {
-      run.stop = true;
-      log('[!] Too many failures in a row; stopping. Next run resumes.');
-    }
-  }
-
-  if (result) {
-    const item = {
-      address: acct.address, track_id: target.id, date: ctx.today, day: ctx.dayName, run_number: run.number,
-      week_start: ctx.weekStart, at: new Date().toISOString(),
-    };
-    let saved = true;
-    try { await recordStream(sb, ctx.weekStart, acct.address, item); } catch (e) {
-      saved = false;
-      PENDING.push(item); savePending();
-      if (e instanceof LockLostError) run.abort = e;
-    }
-    acct.today++;
-    const detail = `${(result.playbackMs / 1000).toFixed(1)}s played in ${(result.wallMs / 1000).toFixed(1)}s, ${Math.round(result.bytes / 1024)} KB${result.ended ? ', stream ended' : ''}, HTTP ${result.status} ${result.contentType}, user ${acct.user_id}`;
-    if (!saved) log(`[!] ${workerId} ${who} -> track ${target.id} | completed (${detail}), DB save failed (kept locally)`);
-    else say(`completed: ${detail}`);
-  }
-
-  if (CFG.streamDelayMs) await sleep(CFG.streamDelayMs);
-  return outcome;
+function markCooldown(state, address, ms = CFG.rateLimitCooldownMs) {
+  state.cooldowns[address] = new Date(Date.now() + ms).toISOString();
 }
 
-async function fillTrack(sb, ctx, run, target, attempts, maxOk, candidates) {
-  let got = 0;
-  let started = 0;
-  let stopWorkers = false;
-
-  const worker = async (id) => {
-    const proxy = PROXY_URLS[(id - 1) % PROXY_URLS.length];
-
-    return asyncLocalStorage.run({ proxy }, async () => {
-      const staggerDelay = (id - 1) * CFG.workerStaggerMs + Math.floor(Math.random() * CFG.workerJitterMs);
-
-      log(`[worker${id}] Streaming ${target.id} | target ${maxOk} (starting in ${(staggerDelay / 1000).toFixed(1)}s)`);
-
-      if (staggerDelay > 0) {
-        await sleep(staggerDelay);
-      }
-
-      while (!stopWorkers) {
-        if (run.abort || LOCK_LOST || run.stop) break;
-        if (CFG.maxRunMs && Date.now() - run.startedAt > CFG.maxRunMs) {
-          run.stop = true;
-          log(`[!] Time limit reached; stopping. Next run resumes.`);
-          break;
-        }
-        if (got >= maxOk || started >= attempts) {
-          stopWorkers = true;
-          break;
-        }
-
-        let acct = candidates.shift();
-        while (acct && run.cool.has(acct.address)) acct = candidates.shift();
-        if (!acct) {
-          stopWorkers = true;
-          break;
-        }
-
-        started++;
-        const outcome = await streamJob(sb, ctx, run, acct, target, `worker${id}`);
-        if (outcome === 'ok') got++;
-      }
-    });
-  };
-
-  const promises = [];
-  for (let i = 1; i <= CFG.workerCount; i++) {
-    promises.push(worker(i));
-  }
-  await Promise.all(promises);
-
-  return { got, started, skipped: started - got };
-}
-
-function countToday(raw, ctx) {
-  let n = 0;
-  if (sameWeek(raw, ctx.weekStart) && Array.isArray(raw.runs)) {
-    for (const r of raw.runs) if (r.date === ctx.today) for (const t of (r.tracks || [])) if (t.status === 'success') n += t.count || 1;
-  }
-  return n;
-}
-
-function countTracks(rows, ctx, runNumber) {
-  const counts = new Map();
-  for (const r of rows) {
-    const f = r.stream;
-    if (!isObj(f) || !sameWeek(f, ctx.weekStart) || !Array.isArray(f.runs)) continue;
-    for (const x of f.runs) {
-      if (x.date !== ctx.today || (runNumber !== undefined && x.run_number !== runNumber)) continue;
-      for (const t of x.tracks || []) {
-        if (t.status !== 'success') continue;
-        const k = String(t.track_id);
-        counts.set(k, (counts.get(k) || 0) + (t.count || 1));
-      }
-    }
-  }
-  return counts;
-}
-
-async function fetchTrendingList(limit = CFG.trendingLimit) {
-  const url = `https://api.audius.co/v1/tracks/trending?time=week&limit=${limit}`;
+// ============ PROXIED FETCH ============
+async function audiusGet(pathname, what, timeoutMs = CFG.callTimeoutMs) {
+  const url = `https://api.audius.co${pathname}`;
   let lastErr;
-  for (let i = 1; i <= 3; i++) {
+  for (let i = 1; i <= CFG.retries; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { headers: { Accept: 'application/json' } });
+      const res = await fetch(url, { headers: { Accept: 'application/json' }, signal: controller.signal });
       if (!res.ok) {
         if (res.status === 429 || res.status >= 500) {
-          await sleep(1000 * i);
+          lastErr = Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
+          await sleep(CFG.rateWaitMs * i);
           continue;
         }
-        log(`[!] Trending fetch returned HTTP ${res.status}`);
-        return [];
+        throw Object.assign(new Error(`HTTP ${res.status}`), { status: res.status });
       }
       const data = await res.json();
       return (data && data.data) || [];
     } catch (e) {
       lastErr = e;
-      if (i < 3) await sleep(1000 * i);
+      const isAbort = controller.signal.aborted || /abort/i.test(String(e.message || ''));
+      if (isAbort) lastErr = new Error(`timeout after ${timeoutMs / 1000}s`);
+      if (i < CFG.retries) await sleep(1000 * i);
+    } finally {
+      clearTimeout(timer);
     }
   }
-  if (lastErr) log(`[!] Failed to fetch trending list: ${lastErr.message}`);
-  return [];
+  throw lastErr || new Error(`${what} failed`);
 }
 
-// MODIFIED: accepts custom + excludeUser. For custom runs, trending selection is skipped
-// and per-track limits are driven by the caller (target == cap == maxPerRun).
-async function processRun(sb, ctx, rows, rawTargets, { runNumber, batch, custom = false, excludeUser = null }) {
-  const accounts = rows.map(r => ({
-    address: r.address, handle: typeof r.handle === 'string' ? r.handle.trim().replace(/^@/, '') : null,
-    user_id: r.user_id, app_data: r.app_data, hasCreds: hasCreds(r),
-    today: countToday(r.stream, ctx),
-  }));
-  const reader = accounts.find(a => a.hasCreds);
-  if (!reader) throw new Error('no account with complete credentials');
-
-  const targetAddrs = new Set(rawTargets.map(p => p.address).filter(Boolean));
-  const excluded = new Set(
-    accounts.filter(a =>
-      targetAddrs.has(a.address) ||
-      (excludeUser && String(a.user_id) === String(excludeUser))
-    ).map(a => a.address)
-  );
-
-  const todayDone = countTracks(rows, ctx);
-  const runDone = countTracks(rows, ctx, runNumber);
-
-  let targets;
-
-  if (custom) {
-    // Custom runs: no trending logic — use rawTargets as-is.
-    targets = rawTargets;
-    log(`[*] Custom stream run ${runNumber}${batch ? ' (resumed)' : ''}: ${targets.length} track(s), target ${targets[0].cap} stream(s) each.`);
-  } else {
-    // Scheduled runs: trending-aware target selection.
-    const trendingTracks = await fetchTrendingList();
-    const rankMap = new Map();
-    const ownerMap = new Map();
-    const handleMap = new Map();
-
-    accounts.forEach(a => {
-      if (a.user_id) ownerMap.set(String(a.user_id), a);
-      if (a.handle) handleMap.set(a.handle.toLowerCase(), a);
-    });
-
-    trendingTracks.forEach((t, i) => rankMap.set(t.id, i + 1));
-
-    const targetTrackIds = new Set(rawTargets.map(t => t.key || t.id));
-    const belowRange = [];
-    const inRange = [];
-    const aboveRange = [];
-
-    for (const t of rawTargets) {
-      const rank = rankMap.get(t.id);
-      if (rank === undefined || rank > CFG.targetRangeMax) belowRange.push(t);
-      else if (rank >= CFG.targetRangeMin) inRange.push(t);
-      else aboveRange.push(t);
-    }
-
-    const previousTargets = [];
-    const previousSeen = new Set();
-    trendingTracks.forEach((t, i) => {
-      const rank = i + 1;
-      if (rank < CFG.trendingTopMin || rank > CFG.trendingTopMax) return;
-      if (targetTrackIds.has(t.id) || previousSeen.has(t.id)) return;
-      const u = t.user || {};
-      const owner = ownerMap.get(String(u.id)) || handleMap.get(String((u.handle || '').toLowerCase()));
-      if (!owner) return;
-      previousSeen.add(t.id);
-      previousTargets.push({
-        id: t.id, key: t.id,
-        address: owner.address, handle: owner.handle,
-        date: ctx.today, day: ctx.dayName,
-        cap: CFG.dailyPerTrack, maxPerRun: CFG.previousWeekPerRun,
-        source: 'previous', trendingRank: rank,
-      });
-    });
-
-    if (rawTargets.length) {
-      const positions = rawTargets.map(t => {
-        const r = rankMap.get(t.id);
-        return `${String(t.id).slice(0, 8)}:${r === undefined ? 'n/a' : `#${r}`}`;
-      }).join(' ');
-      log(`[*] Up_tracks positions: ${positions}`);
-    }
-    log(`[*] Trending: ${inRange.length} in [${CFG.targetRangeMin}-${CFG.targetRangeMax}] (skip), ` +
-        `${aboveRange.length} above ${CFG.targetRangeMin} (skip), ` +
-        `${belowRange.length} below ${CFG.targetRangeMax}/not trending (stream)` +
-        `${previousTargets.length ? `, ${previousTargets.length} previous-week [${CFG.trendingTopMin}-${CFG.trendingTopMax}] bonus` : ''}`);
-
-    targets = [...belowRange, ...previousTargets];
-
-    if (!targets.length) {
-      log(`[*] All ${rawTargets.length} up_tracks at trending 1-${CFG.targetRangeMax} (above or in target range). Nothing to stream.`);
-      await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-        if (!h.batches) h.batches = [];
-        const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
-        if (b && b.done) return false;
-        if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
-        return true;
-      });
-      return { status: 'COMPLETED' };
-    }
-  }
-
-  // For custom runs, attempts & maxOk are scoped to this run slot only.
-  const need = new Map(targets.map(t => {
-    if (custom) {
-      const remaining = Math.max(0, t.cap - (runDone.get(t.key) || 0));
-      return [t.key, { attempts: remaining, maxOk: remaining }];
-    }
-    const left = Math.max(0, t.cap - (todayDone.get(t.key) || 0));
-    const attempts = Math.max(0, t.maxPerRun - (runDone.get(t.key) || 0));
-    return [t.key, { attempts: left ? attempts : 0, maxOk: left }];
-  }));
-
-  let totalNeed = 0;
-  let active = 0;
-  for (const t of targets) {
-    const n = need.get(t.key);
-    if (!n.attempts) continue;
-    totalNeed += Math.min(n.attempts, n.maxOk);
-    active++;
-  }
-
-  if (!totalNeed) {
-    if (!custom && !tracksBelowCap(rows, targets, ctx).length) {
-      log(allDoneMsg(targets.length));
-      return { status: 'ALREADY_COMPLETED' };
-    }
-    await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-      if (!h.batches) h.batches = [];
-      const b = h.batches.find(x => x.date === ctx.today && x.run_number === runNumber);
-      if (b && b.done) return false;
-      if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: runNumber, done: true });
-      return true;
-    });
-    log(`[*] Run ${runNumber}: nothing left to attempt in this run.`);
-    return { status: 'COMPLETED' };
-  }
-
-  const atCap = custom ? 0 : targets.filter(t => (todayDone.get(t.key) || 0) >= t.cap).length;
-  log(`[*] Run ${runNumber}${batch ? ' (resumed)' : ''}: ${active} tracks to do${atCap ? ` (${atCap} already at daily limit)` : ''}, up to ${totalNeed} streams.`);
-
-  if (!batch) {
-    await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-      if (!h.batches) h.batches = [];
-      if (h.batches.some(b => b.date === ctx.today && b.run_number === runNumber)) return false;
-      h.batches.push({ date: ctx.today, run_number: runNumber, done: false });
-      return true;
-    });
-  }
-
-  const run = { todayDone, started: new Map(), meta: new Map(), sdks: new Map(), startedAt: Date.now(), number: runNumber, cool: new Set(), abort: null, stop: false, consecFail: 0, reasons: new Map(), stats: { ok: 0, interrupted: 0, rate: 0, retry: 0, perm: 0 } };
-  const st = run.stats;
-  let incomplete = false;
-
-  for (const t of targets) {
-    const n = need.get(t.key);
-    if (!n.attempts) continue;
-    if (run.stop) { incomplete = true; continue; }
-    const pool = accounts.filter(a => a.hasCreds && !excluded.has(a.address) && !run.cool.has(a.address));
-    const order = shuffle(pool).sort((x, y) => x.today - y.today);
-    const candidates = order.length ? Array.from({ length: n.attempts }, (_, i) => order[i % order.length]) : [];
-
-    const wasVerbose = VERBOSE;
-    VERBOSE = true;
-    const { got, started, skipped } = await fillTrack(sb, ctx, run, t, n.attempts, n.maxOk, candidates);
-    VERBOSE = wasVerbose;
-
-    if (run.abort || LOCK_LOST) throw run.abort || LOCK_LOST;
-    const day = (todayDone.get(t.key) || 0) + got;
-    const inRun = (runDone.get(t.key) || 0) + got;
-    const tag = t.source === 'previous' ? ` (bonus, was #${t.trendingRank})` : '';
-    if (started < n.attempts && got < n.maxOk && !run.stop) {
-      log(`[!] track ${t.id}${tag} | ${custom ? `${inRun}/${t.cap} this run` : `${day}/${t.cap} today`} (no more accounts available${skipped ? `, ${skipped} skipped` : ''})`);
-    } else {
-      log(`[*] track ${t.id}${tag} | ${custom ? `${inRun}/${t.cap} this run` : `${day}/${t.cap} today`}${custom ? '' : day >= t.cap ? ' (done)' : ''}${skipped ? ` (${skipped} skipped)` : ''}`);
-    }
-    if (run.stop) incomplete = true;
-  }
-
-  const left = incomplete;
-  if (!left) {
-    await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-      const b = (h.batches || []).find(x => x.date === ctx.today && x.run_number === runNumber);
-      if (!b || b.done) return false;
-      b.done = true;
-      return true;
-    });
-  }
-  if (run.reasons.size) {
-    const top = [...run.reasons.entries()].sort((a, b) => b[1] - a[1]).slice(0, 4).map(([k, n]) => `${k} x${n}`);
-    log(`[!] Failure reasons: ${top.join(', ')}`);
-  }
-  const parts = [`${st.ok} completed`];
-  if (st.interrupted) parts.push(`${st.interrupted} interrupted`);
-  if (st.rate) parts.push(`${st.rate} rate-limited`);
-  if (st.retry) parts.push(`${st.retry} errors`);
-  if (st.perm) parts.push(`${st.perm} failed`);
-  log(`[*] Run ${runNumber} ${left ? 'incomplete' : 'complete'}: ${parts.join(', ')}.${left ? ' Next run resumes.' : ''}`);
-  return { status: left ? 'INCOMPLETE' : 'COMPLETED' };
+// ============ TRENDING ============
+async function fetchTrending() {
+  const path = `/v1/tracks/trending?time=${CFG.trendingTime}&limit=${CFG.trendingMax}`;
+  return audiusGet(path, 'trending', CFG.callTimeoutMs);
 }
 
-// Scheduled entry point (unchanged behavior).
-async function runStream({ now = new Date() } = {}) {
-  const ctx = buildContext(now);
-  const sb = connectSupabase();
-  PENDING = loadPending();
-
-  const published = collectTracks(await readUpTracks(sb));
-  if (!published.length) {
-    log('[!] No successfully published tracks found in up_tracks. Exiting.');
-    return { status: 'NO_TARGETS' };
-  }
-  log(`[*] Targeting the last published batch (${published[0].date}): ${published.length} track(s).`);
-
-  let rows = await fetchRows(sb);
-  const coordRaw = rows.find(r => r.address === TARGET_ADDRESS).stream;
-  if (isObj(coordRaw) && coordRaw.week_start && !sameWeek(coordRaw, ctx.weekStart)) {
-    log('[*] New week: history reset.');
-  }
-  if (!tracksBelowCap(rows, published, ctx).length) {
-    log(allDoneMsg(published.length));
-    return { status: 'ALREADY_COMPLETED' };
-  }
-
-  const lock = await acquireLock(sb, ctx);
-  if (!lock) return { status: 'LOCKED' };
-  HELD_LOCK = lock;
-  LOCK_LOST = null;
-  const stopHeartbeat = startHeartbeat(sb, ctx);
-
+async function isFollowing(sdk, followerId, targetId) {
   try {
-    await flushPending(sb, ctx);
-    rows = await fetchRows(sb);
-    const coord = normalizeStream(rows.find(r => r.address === TARGET_ADDRESS).stream, ctx.weekStart);
-    if (!tracksBelowCap(rows, published, ctx).length) {
-      log(allDoneMsg(published.length));
-      return { status: 'ALREADY_COMPLETED' };
-    }
-    return await processRun(sb, ctx, rows, published, dayState(coord, ctx.today));
-  } finally {
-    stopHeartbeat();
-    HELD_LOCK = null;
-    await releaseLock(sb, ctx, lock);
-  }
+    const res = await readRetry(() => sdk.users.getUser({ id: targetId, userId: followerId }));
+    const d = res && res.data;
+    const flag = d && (d.doesCurrentUserFollow !== undefined ? d.doesCurrentUserFollow : d.does_current_user_follow);
+    if (typeof flag === 'boolean') return flag;
+  } catch (_) { /* fall through */ }
+  return false;
 }
 
-// ============ NEW: runStreams (tastemaker integration) ============
-// Called from tastemaker.js with a specific track list and per-track target.
-// Uses a custom run number (100..199) so it never collides with the scheduled runs.
-//
-//   runStreams({ tracks: [{ id, title }], target: 10000 })
-//   runStreams({ tracks: [...], target: 10000, excludeUser: 'user-id-to-exclude' })
-//
-// Semantics: "do up to `target` streams per track in THIS invocation". Running twice
-// allocates a fresh custom run number and adds `target` more, unless the pool runs out.
-async function runStreams({ tracks, target, excludeUser = null, now = new Date() } = {}) {
-  if (!Number.isInteger(target) || target <= 0) {
-    throw new Error(`runStreams: target must be a positive integer (got ${target})`);
-  }
-  if (!Array.isArray(tracks) || !tracks.length) {
-    throw new Error('runStreams: tracks array is required');
-  }
+const FOLLOW_STYLES = [
+  (f, t) => ({ id: t, userId: f, followeeUserId: t }),
+  (f, t) => ({ id: f, userId: f, followeeUserId: t }),
+];
 
-  const ctx = buildContext(now);
-  const sb = connectSupabase();
-  PENDING = loadPending();
-
-  const rawTargets = tracks.map(t => ({
-    id: String(t.id),
-    key: String(t.id),
-    address: t.address || null,
-    handle: t.handle || null,
-    date: ctx.today,
-    day: ctx.dayName,
-    cap: target,
-    maxPerRun: target,
-    source: 'custom',
-  }));
-
-  log(`[*] runStreams: ${rawTargets.length} track(s), target ${target} stream(s) per track (total ${rawTargets.length * target}).`);
-
-  const lock = await acquireLock(sb, ctx);
-  if (!lock) return { status: 'LOCKED' };
-  HELD_LOCK = lock;
-  LOCK_LOST = null;
-  const stopHeartbeat = startHeartbeat(sb, ctx);
-
-  try {
-    await flushPending(sb, ctx);
-    const rows = await fetchRows(sb);
-    const coord = normalizeStream(rows.find(r => r.address === TARGET_ADDRESS).stream, ctx.weekStart);
-    const slot = nextCustomRunNumber(coord, ctx.today);
-    if (!slot) {
-      log('[*] runStreams: no free custom run slot today (100..199 all used).');
-      return { status: 'ALREADY_COMPLETED' };
+async function followUser(sdk, followerId, targetId, styleRef) {
+  let lastErr = null;
+  for (const i of styleRef.style === null ? [0, 1] : [styleRef.style]) {
+    lastErr = null;
+    try {
+      await withTimeout(sdk.users.followUser(FOLLOW_STYLES[i](followerId, targetId)), CFG.callTimeoutMs, 'followUser');
+      if (styleRef.style === null) styleRef.style = i;
+      return true;
+    } catch (e) {
+      lastErr = e;
+      if (isRateLimit(e)) throw e;
+      if (!statusOf(e) && /required parameter|invalid/i.test(String(e.message))) continue;
     }
+  }
+  throw lastErr || new Error('follow failed');
+}
 
-    const runDone = countTracks(rows, ctx, slot.runNumber);
-    let anyNeed = false;
-    for (const t of rawTargets) {
-      if ((runDone.get(t.key) || 0) < target) { anyNeed = true; break; }
+async function doTrendingFollow(sb, ctx, state, primary) {
+  const trending = await fetchTrending();
+  if (!trending.length) {
+    log('[!] Trending fetch returned empty; will retry next cycle.');
+    return;
+  }
+
+  const artists = [];
+  const seen = new Set();
+  for (let i = 0; i < trending.length; i++) {
+    const rank = i + 1;
+    if (rank < CFG.trendingMin || rank > CFG.trendingMax) continue;
+    const u = trending[i].user || {};
+    const id = u.id;
+    if (id === undefined || id === null) continue;
+    const sid = String(id);
+    if (seen.has(sid)) continue;
+    seen.add(sid);
+    artists.push({ id: sid, handle: typeof u.handle === 'string' ? u.handle : null, rank });
+  }
+  if (!artists.length) {
+    log('[!] No trending artists in target range.');
+    state.last_trend_check = new Date().toISOString();
+    await saveState(sb, ctx, state);
+    return;
+  }
+  log(`[*] Trending check: ${artists.length} unique artist(s) in positions ${CFG.trendingMin}-${CFG.trendingMax}.`);
+
+  const sdk = makeSdk(primary);
+  const styleRef = { style: null };
+  let followed = 0;
+  let already = 0;
+  let failed = 0;
+  let rateLimitHit = false;
+
+  for (const artist of artists) {
+    if (state.followed[artist.id]) { already++; continue; }
+    if (rateLimitHit) break;
+    try {
+      const isAlready = await isFollowing(sdk, primary.user_id, artist.id);
+      if (isAlready) {
+        state.followed[artist.id] = { handle: artist.handle, at: new Date().toISOString(), already: true };
+        already++;
+        await saveState(sb, ctx, state);
+        continue;
+      }
+      await followUser(sdk, primary.user_id, artist.id, styleRef);
+      state.followed[artist.id] = { handle: artist.handle, at: new Date().toISOString() };
+      followed++;
+      log(`[*] Followed @${artist.handle || artist.id} (#${artist.rank})`);
+      await saveState(sb, ctx, state);
+    } catch (e) {
+      if (isRateLimit(e)) {
+        log('[!] Rate limited on follow; will resume next cycle.');
+        rateLimitHit = true;
+        break;
+      }
+      failed++;
+      if (VERBOSE) log(`[!] Follow @${artist.handle || artist.id} failed: ${errMsg(e).slice(0, 60)}`);
     }
-    if (!anyNeed) {
-      log(`[*] runStreams: all tracks already at ${target} in run ${slot.runNumber}.`);
-      await updateStream(sb, TARGET_ADDRESS, ctx.weekStart, h => {
-        if (!h.batches) h.batches = [];
-        const b = h.batches.find(x => x.date === ctx.today && x.run_number === slot.runNumber);
-        if (b && b.done) return false;
-        if (b) b.done = true; else h.batches.push({ date: ctx.today, run_number: slot.runNumber, done: true });
-        return true;
+    if (CFG.followDelayMs) await sleep(CFG.followDelayMs);
+  }
+
+  if (!rateLimitHit) {
+    state.last_trend_check = new Date().toISOString();
+  }
+  await saveState(sb, ctx, state);
+  log(`[*] Trending follow: ${followed} new, ${already} already, ${failed} failed${rateLimitHit ? ' (rate-limited, will resume)' : ''}.`);
+}
+
+function isTrendingDue(state) {
+  if (FORCE_TRENDING) return true;
+  if (!state.last_trend_check) return true;
+  const last = Date.parse(state.last_trend_check);
+  if (!Number.isFinite(last)) return true;
+  return Date.now() - last >= CFG.trendingCheckMs;
+}
+
+// ============ FEED / FOCUS TRACK SOURCES ============
+async function fetchFeed(userId, limit = CFG.feedLimit) {
+  const path = `/v1/users/${encodeURIComponent(userId)}/feed?limit=${limit}&app_name=tastemaker`;
+  return audiusGet(path, 'feed', CFG.feedTimeoutMs);
+}
+
+async function fetchUserByHandle(handle) {
+  const data = await audiusGet(`/v1/users/handle/${encodeURIComponent(handle)}?app_name=tastemaker`, 'user lookup', CFG.callTimeoutMs);
+  const user = Array.isArray(data) ? data[0] : data;
+  if (!user || !user.id) throw new Error(`user not found: @${handle}`);
+  return user;
+}
+
+async function fetchUserTracks(userId) {
+  const out = [];
+  const seen = new Set();
+  const page = 100;
+  for (let offset = 0; offset < 2000; offset += page) {
+    const data = await audiusGet(`/v1/users/${encodeURIComponent(userId)}/tracks?limit=${page}&offset=${offset}&sort=date&app_name=tastemaker`, 'user tracks', CFG.callTimeoutMs);
+    const list = Array.isArray(data) ? data : [];
+    for (const t of list) {
+      const id = String(t.id);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push({
+        id,
+        user: t.user || { id: userId },
+        title: t.title || '',
+        created_at: t.created_at || t.release_date || null,
       });
-      return { status: 'ALREADY_COMPLETED' };
     }
-
-    return await processRun(sb, ctx, rows, rawTargets, {
-      runNumber: slot.runNumber,
-      batch: slot.batch,
-      custom: true,
-      excludeUser,
-    });
-  } finally {
-    stopHeartbeat();
-    HELD_LOCK = null;
-    await releaseLock(sb, ctx, lock);
+    if (list.length < page) break;
   }
+  return out;
 }
 
-if (require.main === module) {
-  runStream().catch(err => {
-    console.error('[!] Fatal error:', err.message || err);
-    process.exit(1);
+function extractTracks(feedItems) {
+  const out = [];
+  const seen = new Set();
+  for (const it of feedItems) {
+    if (!it) continue;
+    let t = null;
+    if (it.id && it.user) t = it;
+    else if (it.item && it.item.id) t = it.item;
+    else if (it.item_id) t = { id: it.item_id, user: it.user || {} };
+    else if (it.track_id) t = { id: it.track_id, user: it.user || {} };
+    if (!t) continue;
+    const id = String(t.id);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push({ id, user: t.user || {}, title: t.title || '', created_at: t.created_at || t.release_date || null });
+  }
+  return out;
+}
+
+function pruneFedTracks(state) {
+  const cutoff = Date.now() - FEED_TRACK_MAX_AGE_MS;
+  const entries = Object.entries(state.fed_tracks || {});
+  const kept = entries.filter(([, v]) => {
+    const t = Date.parse(v && v.seen_at);
+    return Number.isFinite(t) && t >= cutoff;
   });
+  if (kept.length > STATE_VERSION_MAX_TRACKS) {
+    kept.sort((a, b) => Date.parse(b[1].seen_at) - Date.parse(a[1].seen_at));
+    kept.length = STATE_VERSION_MAX_TRACKS;
+  }
+  state.fed_tracks = Object.fromEntries(kept);
+}
+
+// ============ TRACK DETAILS PRE-CHECK (feed mode only) ============
+async function fetchTrackCounts(trackId) {
+  const data = await audiusGet(`/v1/tracks/${encodeURIComponent(trackId)}?app_name=tastemaker`, 'track details', CFG.callTimeoutMs);
+  const t = Array.isArray(data) ? data[0] : data;
+  if (!t || typeof t !== 'object') throw new Error('track details missing');
+  const favs = Number(t.favorite_count);
+  const reps = Number(t.repost_count);
+  if (!Number.isFinite(favs) || !Number.isFinite(reps)) throw new Error('track details have no favorite/repost counts');
+  return { favs, reps };
+}
+
+function isAlreadyPopular({ favs, reps }) {
+  const n = CFG.skipAtCount;
+  return CFG.skipWhen === 'either' ? (favs >= n || reps >= n) : (favs >= n && reps >= n);
+}
+
+// ============ INTERACTIONS (favs + reposts only) ============
+async function interactTask(state, trackId, kind, acct) {
+  const entry = state.fed_tracks[trackId];
+  if (!entry) return { status: 'skip' };
+  const list = entry[kind];
+  if (list.includes(acct.address)) return { status: 'skip' };
+  try {
+    let sdk = acct._sdk;
+    if (!sdk) { sdk = makeSdk(acct); acct._sdk = sdk; }
+    if (kind === 'favorited_by') {
+      await withTimeout(sdk.tracks.favoriteTrack({ userId: acct.user_id, trackId }), CFG.callTimeoutMs, 'favoriteTrack');
+    } else {
+      await withTimeout(sdk.tracks.repostTrack({ userId: acct.user_id, trackId }), CFG.callTimeoutMs, 'repostTrack');
+    }
+    list.push(acct.address);
+    return { status: 'ok' };
+  } catch (e) {
+    if (isRateLimit(e)) return { status: 'rate', error: e };
+    if (classify(e) === 'permanent') {
+      list.push(acct.address);
+      return { status: 'perm', error: e };
+    }
+    return { status: 'retry', error: e };
+  }
+}
+
+async function runBatch(tasks, concurrency) {
+  for (let i = 0; i < tasks.length; i += concurrency) {
+    const chunk = tasks.slice(i, i + concurrency).map(fn => fn());
+    await Promise.all(chunk);
+  }
+}
+
+async function interactTrackKind(state, trackId, kind, pool, targetCount) {
+  const entry = state.fed_tracks[trackId];
+  if (!entry) return { done: false, reason: 'no-entry' };
+  if (!Array.isArray(entry[kind])) entry[kind] = [];
+  const triedForThisTrack = new Set();
+  let batchCount = 0;
+  const MAX_BATCHES = 60;
+
+  while (entry[kind].length < targetCount) {
+    if (LOCK_LOST) return { done: false, reason: 'lock-lost' };
+    if (++batchCount > MAX_BATCHES) return { done: false, reason: 'batch-cap', partial: entry[kind].length };
+
+    pruneCooldowns(state);
+
+    const doneSet = new Set(entry[kind]);
+    const available = pool.filter(a =>
+      !doneSet.has(a.address) &&
+      !triedForThisTrack.has(a.address) &&
+      !isOnCooldown(state, a.address)
+    );
+
+    if (!available.length) {
+      return { done: false, reason: 'pool-exhausted', partial: entry[kind].length };
+    }
+
+    const need = targetCount - entry[kind].length;
+    const batch = available.slice(0, Math.min(need, CFG.concurrency));
+
+    let batchRateLimits = 0;
+    const tasks = batch.map(acct => async () => {
+      triedForThisTrack.add(acct.address);
+      const result = await interactTask(state, trackId, kind, acct);
+      if (result.status === 'rate') {
+        markCooldown(state, acct.address);
+        batchRateLimits++;
+        if (VERBOSE) log(`[!] ${acct.address.slice(0, 8)}… rate-limited on ${kind} for ${trackId}; cooldown ${Math.round(CFG.rateLimitCooldownMs / 60000)}min.`);
+      }
+    });
+
+    await runBatch(tasks, CFG.concurrency);
+
+    if (batchRateLimits > 0) {
+      await sleep(CFG.rateWaitMs);
+    }
+  }
+
+  return { done: true, partial: entry[kind].length };
+}
+
+// ============ FEED BACKOFF ============
+function shouldSkipFeed(state) {
+  if (FORCE_FEED) return false;
+  if (!state.feed_retry_at) return false;
+  const t = Date.parse(state.feed_retry_at);
+  if (!Number.isFinite(t)) return false;
+  return Date.now() < t;
+}
+
+function recordFeedFailure(state) {
+  state.feed_fail_count = (state.feed_fail_count || 0) + 1;
+  const backoff = Math.min(
+    CFG.feedBackoffBaseMs * 2 ** (state.feed_fail_count - 1),
+    CFG.feedBackoffMaxMs
+  );
+  state.feed_retry_at = new Date(Date.now() + backoff).toISOString();
+  return backoff;
+}
+
+function recordFeedSuccess(state) {
+  state.feed_fail_count = 0;
+  state.feed_retry_at = null;
+}
+
+// ============ DELEGATE TO comment.js ============
+async function delegateComments(focus, tracks) {
+  if (!focus || !focus.commentTarget || focus.commentTarget <= 0) return null;
+  if (!tracks || !tracks.length) return null;
+
+  let commentMod;
+  try {
+    commentMod = require('./comment');
+  } catch (e) {
+    log(`[!] Focus: cannot load ./comment.js (${e.message}); skipping comment step.`);
+    return null;
+  }
+  if (!commentMod || typeof commentMod.runComments !== 'function') {
+    log('[!] Focus: ./comment.js does not export runComments(); skipping comment step.');
+    return null;
+  }
+
+  try {
+    const result = await commentMod.runComments({
+      handle: focus.handle,
+      tracks: tracks.map(t => ({ id: t.id, title: t.title || '' })),
+      target: focus.commentTarget,
+    });
+    return result && result.status;
+  } catch (e) {
+    log(`[!] Focus: comment step failed: ${errMsg(e).slice(0, 100)}`);
+    return 'ERROR';
+  }
+}
+
+// ============ DELEGATE TO stream.js ============
+async function delegateStreams(focus, tracks) {
+  if (!focus || !focus.streamTarget || focus.streamTarget <= 0) return null;
+  if (!tracks || !tracks.length) return null;
+
+  let streamMod;
+  try {
+    streamMod = require('./stream');
+  } catch (e) {
+    log(`[!] Focus: cannot load ./stream.js (${e.message}); skipping stream step.`);
+    return null;
+  }
+  if (!streamMod || typeof streamMod.runStreams !== 'function') {
+    log('[!] Focus: ./stream.js does not export runStreams(); skipping stream step.');
+    return null;
+  }
+
+  try {
+    const result = await streamMod.runStreams({
+      tracks: tracks.map(t => ({ id: t.id, title: t.title || '' })),
+      target: focus.streamTarget,
+      excludeUser: focus.excludeUser || null,
+    });
+    return result && result.status;
+  } catch (e) {
+    log(`[!] Focus: stream step failed: ${errMsg(e).slice(0, 100)}`);
+    return 'ERROR';
+  }
+}
+
+// ============ FEED / FOCUS WORKER ============
+async function doFeedInteract(sb, ctx, state, pool, primary, focus) {
+  let tracks;
+  let trackSource;
+
+  if (focus) {
+    let user;
+    try {
+      user = await fetchUserByHandle(focus.handle);
+    } catch (e) {
+      log(`[!] Could not look up @${focus.handle}: ${errMsg(e).slice(0, 80)}`);
+      return;
+    }
+    log(`[*] Focus: @${user.handle || focus.handle} (${user.id}).`);
+    // Remember the target user so delegateStreams can exclude their alts from the pool.
+    focus.excludeUser = String(user.id);
+
+    try {
+      tracks = await fetchUserTracks(user.id);
+    } catch (e) {
+      log(`[!] Could not fetch tracks for @${focus.handle}: ${errMsg(e).slice(0, 80)}`);
+      return;
+    }
+    log(`[*] Focus: ${tracks.length} total track(s) found.`);
+
+    const today = ctx.today;
+    const tz = CFG.dayTimezone;
+
+    if (focus.oldCount > 0) {
+      // ===== OLD MODE =====
+      // Use the N most recent tracks that were NOT uploaded today.
+      const olderTracks = tracks.filter(t => {
+        if (!t.created_at) return false;
+        const ymd = ymdInTz(t.created_at, tz);
+        return ymd && ymd !== today;
+      });
+
+      if (!olderTracks.length) {
+        log(`[!] Focus: no older (non-today) tracks found for @${user.handle || focus.handle} (today=${today} ${tz}). Exiting.`);
+        return;
+      }
+
+      // newest-first
+      olderTracks.sort((a, b) => {
+        const at = a.created_at ? Date.parse(a.created_at) : 0;
+        const bt = b.created_at ? Date.parse(b.created_at) : 0;
+        return bt - at;
+      });
+
+      const cap = CFG.focusMaxTracks > 0
+        ? Math.min(focus.oldCount, CFG.focusMaxTracks)
+        : focus.oldCount;
+
+      tracks = olderTracks.slice(0, cap);
+      log(`[*] Focus[old]: selected ${tracks.length} older (non-today) track(s) (newest first, from ${olderTracks.length} non-today candidate(s)).`);
+      trackSource = `@${user.handle || focus.handle} (older)`;
+    } else {
+      // ===== TODAY MODE (default) =====
+      const todayTracks = tracks.filter(t => t.created_at && ymdInTz(t.created_at, tz) === today);
+
+      if (!todayTracks.length) {
+        log(`[!] Focus: no latest tracks found — @${user.handle || focus.handle} has no tracks uploaded today (${today} ${tz}). Exiting.`);
+        return;
+      }
+
+      todayTracks.sort((a, b) => {
+        const at = a.created_at ? Date.parse(a.created_at) : 0;
+        const bt = b.created_at ? Date.parse(b.created_at) : 0;
+        return bt - at;
+      });
+      log(`[*] Focus: ${todayTracks.length} of ${tracks.length} track(s) uploaded today (${today} ${tz}).`);
+      tracks = todayTracks;
+
+      if (CFG.focusMaxTracks > 0 && tracks.length > CFG.focusMaxTracks) {
+        const cap = tracks.slice(0, CFG.focusMaxTracks);
+        log(`[*] Focus: capping to ${cap.length} of ${tracks.length} today-track(s) (newest first, FOCUS_MAX_TRACKS=${CFG.focusMaxTracks}).`);
+        tracks = cap;
+      }
+
+      trackSource = `@${user.handle || focus.handle} (today)`;
+    }
+
+    const before = pool.length;
+    pool = pool.filter(a => String(a.user_id) !== String(user.id));
+    if (pool.length !== before) {
+      log(`[*] Focus: removed ${before - pool.length} account(s) matching the target from the pool.`);
+    }
+  } else {
+    let feedItems;
+    try {
+      feedItems = await fetchFeed(primary.user_id, CFG.feedLimit);
+    } catch (e) {
+      const backoff = recordFeedFailure(state);
+      await saveState(sb, ctx, state);
+      log(`[!] Feed fetch failed (attempt ${state.feed_fail_count}, retry in ${Math.round(backoff / 1000)}s): ${errMsg(e).slice(0, 60)}`);
+      return;
+    }
+    recordFeedSuccess(state);
+    tracks = extractTracks(feedItems);
+    trackSource = 'feed';
+  }
+
+  if (!tracks.length) {
+    log(`[*] ${trackSource}: no tracks.`);
+    await saveState(sb, ctx, state);
+    return;
+  }
+
+  const targetFavRep = focus ? focus.target : (CFG._feedTarget || TARGET_INTERACTIONS);
+  const skipFavRep = focus && targetFavRep === 0;
+
+  let pending = [];
+  if (!skipFavRep) {
+    for (const t of tracks) {
+      const entry = state.fed_tracks[t.id];
+      if (!entry) { pending.push(t); continue; }
+      if (entry.skipped) continue;
+      const favs = (entry.favorited_by || []).length;
+      const reps = (entry.reposted_by || []).length;
+      if (favs < targetFavRep || reps < targetFavRep) pending.push(t);
+    }
+  }
+
+  const isFirstRun = focus ? false : (FORCE_FIRST_RUN || !state.first_run_done);
+  if (isFirstRun) {
+    const sorted = [...pending].sort((a, b) => {
+      const at = a.created_at ? Date.parse(a.created_at) : 0;
+      const bt = b.created_at ? Date.parse(b.created_at) : 0;
+      if (at && bt) return bt - at;
+      return 0;
+    });
+    const keep = sorted.slice(0, CFG.firstRunTracks);
+    const skip = sorted.slice(CFG.firstRunTracks);
+    for (const t of skip) {
+      state.fed_tracks[t.id] = {
+        seen_at: new Date().toISOString(),
+        favorited_by: [],
+        reposted_by: [],
+        skipped: true,
+        skip_reason: 'first-run-backlog',
+      };
+    }
+    pending = keep;
+    state.first_run_done = true;
+    log(`[*] First run: taking latest ${keep.length}, skipping ${skip.length} older track(s) from backlog.`);
+  }
+
+  // Nothing to do for favs/reposts → still delegate comments/streams on ALL tracks.
+  if (!pending.length) {
+    log(`[*] ${trackSource}: ${tracks.length} track(s), nothing to do for fav/repost.`);
+    await saveState(sb, ctx, state);
+    if (focus) {
+      const cmtStatus = await delegateComments(focus, tracks);
+      if (cmtStatus) log(`[*] Focus: comment step ${cmtStatus}.`);
+      const strStatus = await delegateStreams(focus, tracks);
+      if (strStatus) log(`[*] Focus: stream step ${strStatus}.`);
+    }
+    return;
+  }
+
+  const limit = focus
+    ? Infinity
+    : (isFirstRun ? Infinity : CFG.maxTracksPerRun);
+  const actionWord = skipFavRep ? 'skipping fav/repost' : `${targetFavRep} favs + ${targetFavRep} reposts per track`;
+  log(`[*] ${trackSource}: ${tracks.length} track(s), ${pending.length} pending. Target: ${actionWord}. Processing up to ${Number.isFinite(limit) ? limit : pending.length} this run.`);
+
+  let processed = 0;
+  for (const t of pending) {
+    if (LOCK_LOST) break;
+    if (processed >= limit) break;
+    const titlePart = t.title ? ` "${t.title.slice(0, 40)}"` : '';
+    const existing = state.fed_tracks[t.id];
+
+    if (!focus) {
+      const started = existing && (((existing.favorited_by || []).length + (existing.reposted_by || []).length) > 0);
+      if (!started) {
+        let counts;
+        try {
+          counts = await fetchTrackCounts(t.id);
+        } catch (e) {
+          log(`[!] Track ${t.id}${titlePart} | could not read track details (${errMsg(e).slice(0, 60)}); not interacting now, will retry.`);
+          continue;
+        }
+        if (isAlreadyPopular(counts)) {
+          state.fed_tracks[t.id] = {
+            seen_at: new Date().toISOString(),
+            favorited_by: [],
+            reposted_by: [],
+            skipped: true,
+            skip_reason: 'already-popular',
+            favorite_count: counts.favs,
+            repost_count: counts.reps,
+          };
+          await saveState(sb, ctx, state);
+          log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | skipped (${CFG.skipWhen === 'either' ? 'either count' : 'both counts'} already >= ${CFG.skipAtCount}).`);
+          continue;
+        }
+        if (VERBOSE) log(`[*] Track ${t.id}${titlePart} | FAV ${counts.favs} | REP ${counts.reps} | below ${CFG.skipAtCount}, interacting.`);
+      }
+    }
+
+    processed++;
+    if (!state.fed_tracks[t.id]) {
+      state.fed_tracks[t.id] = {
+        seen_at: new Date().toISOString(),
+        favorited_by: [],
+        reposted_by: [],
+        title: t.title || '',
+      };
+    }
+    const entry = state.fed_tracks[t.id];
+    if (!entry.title && t.title) entry.title = t.title;
+
+    const favResult = await interactTrackKind(state, t.id, 'favorited_by', pool, targetFavRep);
+    await saveState(sb, ctx, state);
+    if (!favResult.done && favResult.reason === 'lock-lost') break;
+
+    const repResult = await interactTrackKind(state, t.id, 'reposted_by', pool, targetFavRep);
+    await saveState(sb, ctx, state);
+    if (!repResult.done && repResult.reason === 'lock-lost') break;
+
+    const tags = [];
+    if (!favResult.done) tags.push(`fav:${favResult.reason}`);
+    if (!repResult.done) tags.push(`rep:${repResult.reason}`);
+    const suffix = tags.length ? ` (${tags.join(', ')})` : '';
+    log(`[*] Track ${t.id}${titlePart} | FAV ${(entry.favorited_by || []).length}/${targetFavRep} | REP ${(entry.reposted_by || []).length}/${targetFavRep}${suffix}`);
+
+    if (CFG.actionDelayMs) await sleep(CFG.actionDelayMs);
+  }
+
+  if (focus) {
+    if (LOCK_LOST) {
+      log('[!] Focus: tastemaker lock lost; skipping comment/stream delegation.');
+    } else {
+      const forDelegation = processed > 0 ? pending.slice(0, processed) : tracks;
+      if (!forDelegation.length) {
+        log('[*] Focus: no tracks to delegate this run.');
+      } else {
+        log(`[*] Focus: handing ${forDelegation.length} track(s) to comment.js (target ${focus.commentTarget} per track).`);
+        const cmtStatus = await delegateComments(focus, forDelegation);
+        if (cmtStatus === 'LOCKED') {
+          log('[!] Focus: comment lock held by another run; skipping comment step this cycle.');
+        } else if (cmtStatus) {
+          log(`[*] Focus: comment step ${cmtStatus}.`);
+        }
+
+        if (focus.streamTarget > 0) {
+          log(`[*] Focus: handing ${forDelegation.length} track(s) to stream.js (target ${focus.streamTarget} streams per track).`);
+          const strStatus = await delegateStreams(focus, forDelegation);
+          if (strStatus === 'LOCKED') {
+            log('[!] Focus: stream lock held by another run; skipping stream step this cycle.');
+          } else if (strStatus) {
+            log(`[*] Focus: stream step ${strStatus}.`);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ============ MAIN ============
+async function runTastemaker({ now = new Date(), focus = null } = {}) {
+  const ctx = buildContext(now);
+  const sb = connectSupabase();
+
+  const primary = await fetchPrimary(sb);
+  if (!hasCreds(primary)) throw new Error(`primary account ${TARGET_ADDRESS} has no complete credentials (need user_id + app_data.api_key + api_secret + bearer_token)`);
+
+  const lock = await acquireLock(sb, ctx);
+  if (!lock) return { status: 'LOCKED' };
+  HELD_LOCK = lock;
+  LOCK_LOST = null;
+  const stopHeartbeat = startHeartbeat(sb, ctx);
+
+  try {
+    const { data: primaryRow } = await sb.from('audius')
+      .select('t_maker').eq('address', TARGET_ADDRESS).limit(1);
+    const state = normalizeTmaker(primaryRow && primaryRow[0] && primaryRow[0].t_maker, ctx.weekStart);
+
+    pruneCooldowns(state);
+
+    const helpers = await fetchHelperPool(sb, TARGET_ADDRESS);
+    if (!helpers.length) {
+      log('[!] No helper accounts with creds available.');
+    }
+    const pool = [primary, ...shuffle(helpers)];
+    const availableNow = pool.filter(a => !isOnCooldown(state, a.address)).length;
+    log(`[*] Pool: ${pool.length} accounts (${availableNow} available, ${pool.length - availableNow} cooling down).`);
+
+    pruneFedTracks(state);
+
+    if (focus) {
+      log('[*] Focus mode: skipping trending follow.');
+    } else if (isTrendingDue(state)) {
+      log(`[*] Trending follow cycle due (last: ${state.last_trend_check || 'never'}).`);
+      try {
+        await doTrendingFollow(sb, ctx, state, primary);
+      } catch (e) {
+        log(`[!] Trending cycle failed; will retry next run: ${errMsg(e).slice(0, 80)}`);
+      }
+    } else {
+      const next = new Date(Date.parse(state.last_trend_check) + CFG.trendingCheckMs);
+      if (VERBOSE) log(`[*] Trending cycle next due: ${next.toISOString()}.`);
+    }
+
+    if (LOCK_LOST) throw LOCK_LOST;
+
+    if (!focus && shouldSkipFeed(state)) {
+      const remain = Math.round((Date.parse(state.feed_retry_at) - Date.now()) / 1000);
+      log(`[*] Feed backoff active (${remain}s remaining, ${state.feed_fail_count} consecutive failures). Skipping feed.`);
+    } else {
+      await doFeedInteract(sb, ctx, state, pool, primary, focus);
+    }
+
+    await saveState(sb, ctx, state);
+    return { status: 'OK', pool: pool.length };
+  } finally {
+    stopHeartbeat();
+    HELD_LOCK = null;
+    await releaseLock(sb, ctx, lock);
+  }
+}
+
+// ============ LOOP CONTROL ============
+let shuttingDown = false;
+let shutdownSignal = null;
+
+function installSignalHandlers() {
+  const handler = sig => {
+    if (shuttingDown) {
+      log(`[!] ${sig} received again; forcing exit.`);
+      process.exit(1);
+    }
+    shuttingDown = true;
+    shutdownSignal = sig;
+    log(`[*] ${sig} received; will exit after current cycle.`);
+  };
+  process.on('SIGINT', () => handler('SIGINT'));
+  process.on('SIGTERM', () => handler('SIGTERM'));
+}
+
+async function sleepInterruptible(ms) {
+  const deadline = Date.now() + ms;
+  while (!shuttingDown && Date.now() < deadline) {
+    await sleep(Math.min(1000, deadline - Date.now()));
+  }
+}
+
+async function loopForever(focus) {
+  installSignalHandlers();
+
+  if (focus) {
+    log('[*] Focus mode: running a single cycle then exiting.');
+    try {
+      await runTastemaker({ focus });
+    } catch (e) {
+      if (e instanceof LockLostError) log('[!] Lock lost.');
+      else log(`[!] Focus cycle failed: ${errMsg(e).slice(0, 100)}`);
+      process.exit(1);
+    }
+    return;
+  }
+
+  const waitSec = Math.round(CFG.loopIntervalMs / 1000);
+  log(`[*] Loop mode active (interval ${waitSec}s). Press Ctrl+C to stop.`);
+
+  let cycle = 0;
+  while (!shuttingDown) {
+    cycle++;
+    const started = Date.now();
+    if (cycle > 1) log(`[*] ─── Cycle ${cycle} ───`);
+    try {
+      await runTastemaker();
+    } catch (e) {
+      if (e instanceof LockLostError) {
+        log(`[!] Lock lost; will retry next cycle.`);
+      } else {
+        log(`[!] Cycle failed: ${errMsg(e).slice(0, 100)}`);
+      }
+    }
+    const elapsed = Math.round((Date.now() - started) / 1000);
+    if (shuttingDown) break;
+    log(`[*] Cycle ${cycle} complete in ${elapsed}s. Next scan in ${waitSec}s.`);
+    await sleepInterruptible(CFG.loopIntervalMs);
+  }
+  log(`[*] Tastemaker stopped${shutdownSignal ? ` (${shutdownSignal})` : ''}.`);
+}
+
+// ============ ENTRY ============
+if (require.main === module) {
+  const focus = parseCliFocus();
+
+  if (ONCE) {
+    runTastemaker({ focus })
+      .then(() => process.exit(0))
+      .catch(err => {
+        console.error('[!] Fatal error:', err.message || err);
+        process.exit(1);
+      });
+  } else if (focus) {
+    loopForever(focus).catch(err => {
+      console.error('[!] Fatal error:', err.message || err);
+      process.exit(1);
+    });
+  } else {
+    loopForever(null).catch(err => {
+      console.error('[!] Fatal error:', err.message || err);
+      process.exit(1);
+    });
+  }
 }
 
 module.exports = {
-  runStream,
-  runStreams,
-  collectTracks,
+  runTastemaker,
   buildContext,
   CFG,
+  TARGET_INTERACTIONS,
+  fetchTrackCounts,
+  isAlreadyPopular,
+  doFeedInteract,
+  fetchUserByHandle,
+  fetchUserTracks,
+  parseCliFocus,
+  parseCount,
+  delegateComments,
+  delegateStreams,
+  ymdInTz,
 };
